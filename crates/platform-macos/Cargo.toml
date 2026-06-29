@@ -1,0 +1,14 @@
+[package]
+name = "spotlight-platform-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+plist.workspace = true
+walkdir.workspace = true
+objc = "0.2"
+# Debug self-capture of our own window (CGWindowListCreateImage -> PNG).
+core-graphics = "0.24"
+image = { version = "0.25", default-features = false, features = ["png"] }

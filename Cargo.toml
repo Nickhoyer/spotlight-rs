@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/platform-macos",
+    "crates/ui",
+    "crates/app",
+    "extensions/apps",
+    "extensions/calculator",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+# Pinned to a specific gpui-ce commit; GPUI is pre-1.0 and churns, so we keep
+# both gpui and its platform crate from the same source tree (see plan).
+gpui = { git = "https://github.com/gpui-ce/gpui-ce", rev = "ce08af96db6c3474ab3b388325cdd1a7c3de06d9" }
+# `font-kit` is REQUIRED on macOS for real glyph rasterization — without it
+# gpui falls back to a placeholder text system that renders no glyphs (blank
+# text). The feature didn't propagate transitively, so we enable it directly.
+# `runtime_shaders` compiles Metal shaders at runtime instead of build time.
+gpui_platform = { git = "https://github.com/gpui-ce/gpui-ce", rev = "ce08af96db6c3474ab3b388325cdd1a7c3de06d9", features = ["font-kit", "runtime_shaders"] }
+
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+nucleo-matcher = "0.3"
+plist = "1"
+walkdir = "2"
+meval = "0.2"
+
+# Internal crates
+spotlight-core = { path = "crates/core" }
+spotlight-platform-macos = { path = "crates/platform-macos" }
+spotlight-ui = { path = "crates/ui" }
+ext-apps = { path = "extensions/apps" }
+ext-calculator = { path = "extensions/calculator" }
+
+[profile.dev]
+# GPUI is heavy; a little optimization on deps keeps dev runs smooth without
+# slowing our own iterative compiles.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2

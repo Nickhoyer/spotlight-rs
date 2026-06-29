@@ -1,0 +1,17 @@
+[package]
+name = "spotlight-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+spotlight-core.workspace = true
+spotlight-platform-macos.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+env_logger = "0.11"

@@ -1,0 +1,10 @@
+[package]
+name = "ext-calculator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spotlight-core.workspace = true
+async-trait.workspace = true
+meval.workspace = true

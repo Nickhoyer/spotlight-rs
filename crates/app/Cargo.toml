@@ -1,0 +1,15 @@
+[package]
+name = "spotlight"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spotlight"
+path = "src/main.rs"
+
+[dependencies]
+spotlight-core.workspace = true
+spotlight-ui.workspace = true
+ext-apps.workspace = true
+ext-calculator.workspace = true
