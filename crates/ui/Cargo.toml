@@ -12,6 +12,9 @@ spotlight-platform-macos.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 raw-window-handle = "0.6"
+# Building gpui `RenderImage`s from rasterized app-icon pixels. Must match
+# gpui's `image` version so `image::Frame` is the same type instance.
+image = { version = "0.25", default-features = false }
 
 [dev-dependencies]
 env_logger = "0.11"

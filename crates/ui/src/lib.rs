@@ -3,14 +3,16 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::executor::block_on;
 use gpui::prelude::*;
 use gpui::{
-    div, ease_in_out, linear, px, rgb, rgba, size, Animation, AnimationExt as _, App, Bounds,
-    Context, FocusHandle, KeyDownEvent, Rgba, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions,
+    div, ease_in_out, img, linear, px, rgb, rgba, size, Animation, AnimationExt as _, App, Bounds,
+    Context, FocusHandle, ImageSource, KeyDownEvent, ObjectFit, Rgba, RenderImage, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
 use spotlight_core::{Action, Icon, Registry, ResultItem};
@@ -31,6 +33,9 @@ pub struct SpotlightView {
     results: Vec<ResultItem>,
     selected: usize,
     focus_handle: FocusHandle,
+    /// Rasterized app icons keyed by path, so each icon is rasterized once and
+    /// reused across frames (gpui's `RenderImage` is cached by `Arc` identity).
+    icon_cache: HashMap<PathBuf, Arc<RenderImage>>,
 }
 
 impl SpotlightView {
@@ -55,6 +60,7 @@ impl SpotlightView {
             results: Vec::new(),
             selected: 0,
             focus_handle,
+            icon_cache: HashMap::new(),
         };
 
         // Debug aid: pre-fill a query so captures can show result states.
@@ -98,10 +104,36 @@ impl SpotlightView {
         cx.notify();
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Toggle the panel on screen. Called from the global hotkey. On show we
+    /// clear the query so each summon starts fresh, and re-take focus.
+    fn toggle_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ns_view) = appkit_view_ptr(window) else {
+            return;
+        };
+        if spotlight_platform_macos::window::panel_visible(ns_view) {
+            spotlight_platform_macos::window::hide_panel(ns_view);
+        } else {
+            spotlight_platform_macos::window::show_panel(ns_view);
+            self.query.clear();
+            self.results.clear();
+            self.selected = 0;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Hide the panel (Escape). The app keeps running in accessory mode so the
+    /// hotkey can summon it again.
+    fn hide(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        if let Some(ns_view) = appkit_view_ptr(window) {
+            spotlight_platform_macos::window::hide_panel(ns_view);
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         match ks.key.as_str() {
-            "escape" => cx.quit(),
+            "escape" => self.hide(window, cx),
             "backspace" => {
                 self.query.pop();
                 self.refresh(cx);
@@ -178,7 +210,10 @@ impl Render for SpotlightView {
                     .iter()
                     .take(MAX_RESULTS)
                     .enumerate()
-                    .map(|(i, item)| result_row(item, i == self.selected, accent, text, muted)),
+                    .map(|(i, item)| {
+                        let icon = resolve_icon(&mut self.icon_cache, &item.icon);
+                        result_row(item, icon, i == self.selected, accent, text, muted)
+                    }),
             );
 
         let panel = div()
@@ -219,31 +254,90 @@ impl Render for SpotlightView {
     }
 }
 
+/// Resolve an item's icon to a cached gpui `RenderImage`. Only `Icon::File`
+/// (app bundles) is rasterized here; glyphs render as text and everything else
+/// falls back to the letter tile. Rasterization happens once per path and the
+/// `Arc<RenderImage>` is reused, so re-renders are cheap and the texture isn't
+/// re-uploaded each frame.
+///
+/// This is a free function (not a method) so `render` can borrow `icon_cache`
+/// mutably while `results` is borrowed immutably — Rust allows disjoint field
+/// borrows, but not when a `&mut self` method would borrow the whole view.
+fn resolve_icon(
+    cache: &mut HashMap<PathBuf, Arc<RenderImage>>,
+    icon: &Option<Icon>,
+) -> Option<Arc<RenderImage>> {
+    let Some(Icon::File(path)) = icon else {
+        return None;
+    };
+    if let Some(cached) = cache.get(path) {
+        return Some(cached.clone());
+    }
+    let pixels = spotlight_platform_macos::icons::icon_for_file(path)?;
+    // The rasterizer emits premultiplied-alpha RGBA; gpui's `RenderImage` wants
+    // straight-alpha BGRA. Un-premultiply, then swap R<->B (bytes 0&2) — the same
+    // RGBA→BGRA reorder gpui's own image loader does.
+    let mut bytes = (*pixels.data).clone();
+    for px in bytes.chunks_exact_mut(4) {
+        let a = px[3];
+        if a != 0 && a != 255 {
+            let unmul = |c: u8| ((c as u16 * 255 + a as u16 / 2) / a as u16).min(255) as u8;
+            px[0] = unmul(px[0]);
+            px[1] = unmul(px[1]);
+            px[2] = unmul(px[2]);
+        }
+        px.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(pixels.width, pixels.height, bytes)?;
+    let frame = image::Frame::new(buffer);
+    let render_image = Arc::new(RenderImage::new(vec![frame]));
+    cache.insert(path.clone(), render_image.clone());
+    Some(render_image)
+}
+
 fn result_row(
     item: &ResultItem,
+    icon: Option<Arc<RenderImage>>,
     selected: bool,
     accent: Rgba,
     text: Rgba,
     muted: Rgba,
 ) -> impl IntoElement {
-    let leading = match &item.icon {
-        Some(Icon::Glyph(glyph)) => div().text_2xl().child(glyph.clone()),
-        _ => div()
+    let leading = if let Some(render_image) = icon {
+        // Real app icon (rasterized from NSWorkspace). Contain-fit so square
+        // app icons don't stretch within the 28px slot; the wrapper div fixes
+        // the slot size so the leading column aligns with glyph/letter tiles.
+        div()
             .size(px(28.))
-            .rounded_md()
-            .bg(rgba(0x6e_e7ff_22))
             .flex()
             .items_center()
             .justify_center()
-            .text_sm()
-            .text_color(accent)
             .child(
-                item.title
-                    .chars()
-                    .next()
-                    .map(|c| c.to_uppercase().to_string())
-                    .unwrap_or_default(),
-            ),
+                img(ImageSource::Render(render_image))
+                    .w(px(28.))
+                    .h(px(28.))
+                    .object_fit(ObjectFit::Contain),
+            )
+    } else {
+        match &item.icon {
+            Some(Icon::Glyph(glyph)) => div().text_2xl().child(glyph.clone()),
+            _ => div()
+                .size(px(28.))
+                .rounded_md()
+                .bg(rgba(0x6e_e7ff_22))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(accent)
+                .child(
+                    item.title
+                        .chars()
+                        .next()
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_default(),
+                ),
+        }
     };
 
     div()
@@ -327,6 +421,9 @@ pub fn run(registry: Registry) {
     let registry = Arc::new(registry);
     spawn_capture_thread();
     gpui_platform::application().run(move |cx: &mut App| {
+        // No Dock icon / app menu — run as a background accessory like Spotlight.
+        // The PopUp panel still floats over fullscreen Spaces and can take focus.
+        spotlight_platform_macos::window::set_accessory_activation_policy();
         cx.activate(true);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -336,21 +433,68 @@ pub fn run(registry: Registry) {
         .detach();
 
         let bounds = Bounds::centered(None, size(px(680.), px(520.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: None,
-                window_background: WindowBackgroundAppearance::Transparent,
-                kind: WindowKind::PopUp,
-                is_movable: false,
-                is_resizable: false,
-                is_minimizable: false,
-                focus: true,
-                show: true,
-                ..Default::default()
-            },
-            move |window, cx| cx.new(|cx| SpotlightView::new(registry.clone(), window, cx)),
-        )
-        .expect("failed to open launcher window");
+        let window_handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: None,
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    kind: WindowKind::PopUp,
+                    is_movable: false,
+                    is_resizable: false,
+                    is_minimizable: false,
+                    focus: true,
+                    show: true,
+                    ..Default::default()
+                },
+                move |window, cx| cx.new(|cx| SpotlightView::new(registry.clone(), window, cx)),
+            )
+            .expect("failed to open launcher window");
+
+        register_global_hotkey(cx, window_handle);
     });
+}
+
+/// Register the system-wide hotkey that summons the launcher. The hotkey fires
+/// on the main thread; we hand off to gpui's foreground executor via
+/// `AsyncApp::spawn` so the view update runs at a safe point in the run loop
+/// rather than re-entering a borrow mid-update.
+///
+/// The returned `GlobalHotkey` is leaked: it must outlive the `run` closure's
+/// stack frame (which returns immediately after setup), and the process is a
+/// single long-lived launcher, so unregistering at exit is unnecessary.
+fn register_global_hotkey(cx: &mut App, window_handle: WindowHandle<SpotlightView>) {
+    let spec = std::env::var("SPOTLIGHT_HOTKEY").unwrap_or_else(|_| "cmd+space".to_string());
+    let (key_code, modifiers) =
+        match spotlight_platform_macos::hotkey::parse(&spec) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("spotlight: bad SPOTLIGHT_HOTKEY=`{spec}` ({e}); defaulting to cmd+space");
+                (49, spotlight_platform_macos::hotkey::CMD_KEY)
+            }
+        };
+
+    let async_cx = cx.to_async();
+    let hotkey = match spotlight_platform_macos::hotkey::GlobalHotkey::register(
+        key_code,
+        modifiers,
+        Box::new(move || {
+            let handle = window_handle;
+            async_cx
+                .spawn(async move |cx| {
+                    let _ = handle.update(cx, |view, window, cx| {
+                        view.toggle_visibility(window, cx);
+                    });
+                })
+                .detach();
+        }),
+    ) {
+        Ok(hk) => hk,
+        Err(e) => {
+            eprintln!("spotlight: failed to register global hotkey `{spec}`: {e}");
+            return;
+        }
+    };
+    // Keep the registration alive for the lifetime of the process.
+    Box::leak(Box::new(hotkey));
 }

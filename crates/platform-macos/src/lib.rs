@@ -7,4 +7,6 @@
 
 pub mod apps;
 pub mod capture;
+pub mod hotkey;
+pub mod icons;
 pub mod window;

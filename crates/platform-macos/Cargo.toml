@@ -9,6 +9,7 @@ anyhow.workspace = true
 plist.workspace = true
 walkdir.workspace = true
 objc = "0.2"
-# Debug self-capture of our own window (CGWindowListCreateImage -> PNG).
+# Debug self-capture of our own window (CGWindowListCreateImage -> PNG), and
+# rasterizing app icons via NSWorkspace (NSImage -> NSBitmapImageRep -> RGBA).
 core-graphics = "0.24"
 image = { version = "0.25", default-features = false, features = ["png"] }

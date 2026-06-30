@@ -5233,6 +5233,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "image",
  "raw-window-handle",
  "spotlight-core",
  "spotlight-platform-macos",
