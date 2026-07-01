@@ -20,6 +20,9 @@ pub const DIVIDER: u32 = 0xff_ffff_14;
 pub const SELECTED: u32 = 0x6e_e7ff_1f;
 /// Faint cyan fill for letter tiles / icon chips (RGBA).
 pub const TILE: u32 = 0x6e_e7ff_22;
+/// Neutral backing for icon tiles — a hair lighter than the panel so transparent
+/// icons and glyphs sit on a subtle solid tile rather than floating (RGBA).
+pub const ICON_BG: u32 = 0xff_ffff_12;
 /// Hover wash for clickable rows/buttons (RGBA).
 pub const HOVER: u32 = 0x6e_e7ff_14;
 /// Stronger hover for buttons that already have a faint cyan fill (so the
@@ -58,6 +61,9 @@ pub fn selected() -> Rgba {
 }
 pub fn tile() -> Rgba {
     rgba(TILE)
+}
+pub fn icon_bg() -> Rgba {
+    rgba(ICON_BG)
 }
 pub fn hover() -> Rgba {
     rgba(HOVER)

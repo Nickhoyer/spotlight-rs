@@ -43,6 +43,59 @@ fn dump_icon_png(pixels: &IconPixels, source: &Path) {
     }
 }
 
+/// Alpha value (0-255) below which a pixel counts as transparent margin.
+const ALPHA_CUTOFF: u8 = 12;
+
+/// Trim uniform transparent margins and rescale so the visible artwork fills the
+/// tile. Native `.app` icons carry wildly varying built-in padding — Slack's mark
+/// floats in a large transparent square while Firefox's fills its canvas — which
+/// makes a row of them look ragged next to the full-bleed extension logos. Cropping
+/// to the opaque bounds and re-fitting equalizes their on-screen size.
+///
+/// The buffer is premultiplied-alpha RGBA (see the module note), which resamples
+/// cleanly here; the UI layer un-premultiplies later.
+fn normalize(pixels: IconPixels) -> IconPixels {
+    let (w, h) = (pixels.width, pixels.height);
+    let Some(mut img) = image::RgbaImage::from_raw(w, h, (*pixels.data).clone()) else {
+        return pixels;
+    };
+    // Opaque bounding box.
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            if img.get_pixel(x, y)[3] > ALPHA_CUTOFF {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 || y1 < y0 {
+        return pixels; // fully transparent — nothing to normalize
+    }
+    let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+    // Already fills the tile (within a pixel or two)? Skip the resample.
+    if bw >= w.saturating_sub(2) && bh >= h.saturating_sub(2) {
+        return pixels;
+    }
+    let cropped = image::imageops::crop(&mut img, x0, y0, bw, bh).to_image();
+    // Scale the cropped art to fill the tile, preserving aspect and centering it
+    // on a transparent canvas. `replace` copies pixels verbatim (no compositing),
+    // so the premultiplied values survive intact.
+    let scale = (w as f32 / bw as f32).min(h as f32 / bh as f32);
+    let nw = ((bw as f32 * scale).round() as u32).clamp(1, w);
+    let nh = ((bh as f32 * scale).round() as u32).clamp(1, h);
+    let resized = image::imageops::resize(&cropped, nw, nh, image::imageops::FilterType::Lanczos3);
+    let mut canvas = image::RgbaImage::new(w, h);
+    image::imageops::replace(&mut canvas, &resized, ((w - nw) / 2) as i64, ((h - nh) / 2) as i64);
+    IconPixels {
+        width: w,
+        height: h,
+        data: Arc::new(canvas.into_raw()),
+    }
+}
+
 /// Raw RGBA pixel buffer for a rasterized icon.
 pub struct IconPixels {
     pub width: u32,
@@ -70,7 +123,7 @@ pub fn icon_for_file(path: &Path) -> Option<Arc<IconPixels>> {
             return entry.clone();
         }
     }
-    let pixels = rasterize(path).map(Arc::new);
+    let pixels = rasterize(path).map(normalize).map(Arc::new);
     if let Ok(mut map) = cache().lock() {
         map.insert(key, pixels.clone());
     }

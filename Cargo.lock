@@ -5353,6 +5353,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "raw-window-handle",
+ "resvg",
  "spotlight-config",
  "spotlight-core",
  "spotlight-platform-macos",

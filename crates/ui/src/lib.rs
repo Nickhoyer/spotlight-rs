@@ -12,6 +12,7 @@ pub mod list;
 pub mod text_input;
 pub mod theme;
 
+mod logo;
 mod settings;
 
 use std::collections::HashMap;
@@ -476,11 +477,11 @@ impl SpotlightView {
             }
             (HomeSel::Recents(i), "left") => HomeSel::Recents(i.saturating_sub(1)),
             (HomeSel::Recents(_), "down") => HomeSel::Shortcuts(0),
-            (HomeSel::Shortcuts(0), "up") if recents > 0 => HomeSel::Recents(0),
-            (HomeSel::Shortcuts(i), "up") => HomeSel::Shortcuts(i.saturating_sub(1)),
-            (HomeSel::Shortcuts(i), "down") => {
+            (HomeSel::Shortcuts(_), "up") if recents > 0 => HomeSel::Recents(0),
+            (HomeSel::Shortcuts(i), "right") => {
                 HomeSel::Shortcuts((i + 1).min(shortcuts.saturating_sub(1)))
             }
+            (HomeSel::Shortcuts(i), "left") => HomeSel::Shortcuts(i.saturating_sub(1)),
             (other, _) => other,
         };
         // Scrolling the selection into view is handled by the animated scroll in
@@ -887,29 +888,10 @@ impl SpotlightView {
                 .track_scroll(&self.recents_scroll);
             for (i, recent) in recents.iter().take(MAX_RECENTS).enumerate() {
                 let entry = recent.clone();
+                let leading = recent_leading(&mut self.icon_cache, recent);
                 strip = strip.child(
-                    div()
+                    home_card(leading, &recent.title)
                         .id(("home-recent", i))
-                        .flex_shrink_0()
-                        .w(px(92.))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_3()
-                        .rounded_xl()
-                        .hover(|s| s.bg(theme::hover()))
-                        .child(recent_leading(&mut self.icon_cache, recent, 40.))
-                        .child(
-                            div()
-                                .w_full()
-                                .text_center()
-                                .text_sm()
-                                .truncate()
-                                .text_color(theme::text())
-                                .child(recent.title.clone()),
-                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -928,49 +910,54 @@ impl SpotlightView {
             );
         }
 
-        // Shortcuts — extension panels + Settings, in a vertical scroll list.
+        // Shortcuts — extension panels + Settings, as a horizontal, scrollable
+        // strip of the same compact cards used by "Recently opened".
         col = col.child(section_label("Shortcuts"));
-        let mut list = div()
+        let mut strip = div()
             .id("home-shortcuts")
             .flex()
-            .flex_col()
-            .gap_1()
-            .max_h(px(190.))
-            .overflow_y_scroll()
+            .flex_row()
+            .gap_2()
+            .px_1()
+            .pb_1()
+            .overflow_x_scroll()
             .track_scroll(&self.shortcuts_scroll);
         for (i, p) in self.ui.panels.iter().enumerate() {
-            let selected = self.home_sel == HomeSel::Shortcuts(i);
             let id = p.id.clone();
-            let leading = match &p.icon {
-                Some(icon) => image_leading(&mut self.icon_cache, icon, 28.)
-                    .unwrap_or_else(|| glyph_tile(&p.glyph)),
-                None => glyph_tile(&p.glyph),
-            };
-            list = list.child(
-                simple_row(leading, &p.title, selected).on_mouse_down(
+            // Prefer a generated built-in logo (Clipboard), then the panel's own
+            // image icon, then its glyph on the shared tile.
+            let leading = logo_tile(&p.id)
+                .or_else(|| {
+                    p.icon
+                        .as_ref()
+                        .and_then(|icon| image_tile(&mut self.icon_cache, icon))
+                })
+                .unwrap_or_else(|| glyph_tile(&p.glyph));
+            strip = strip.child(
+                home_card(leading, &p.title).id(("home-shortcut", i)).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| this.go_panel(&id, cx)),
                 ),
             );
         }
-        let settings_selected = self.home_sel == HomeSel::Shortcuts(self.ui.panels.len());
-        list = list.child(
-            simple_row(glyph_tile("⚙"), "Settings", settings_selected).on_mouse_down(
+        strip = strip.child(
+            home_card(
+                logo_tile("settings").unwrap_or_else(|| glyph_tile("⚙")),
+                "Settings",
+            )
+            .id(("home-shortcut", self.ui.panels.len()))
+            .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.go_settings(cx)),
             ),
         );
-        let pill = self.highlight_pill(HlContext::Shortcuts, &self.shortcuts_scroll, HL_RADIUS);
+        let pill = self.highlight_pill(HlContext::Shortcuts, &self.shortcuts_scroll, 12.);
         col = col.child(
             div()
                 .relative()
                 .overflow_hidden()
                 .when_some(pill, |a, p| a.child(p))
-                .child(list::faded_scroll(
-                    &self.shortcuts_scroll,
-                    false,
-                    list.into_any_element(),
-                )),
+                .child(strip),
         );
 
         col.into_any_element()
@@ -1155,7 +1142,7 @@ impl SpotlightView {
         self.hl_ready = true;
 
         // --- scroll the selection into view at the pill's speed ---
-        let horizontal = matches!(ctx, HlContext::Recents);
+        let horizontal = matches!(ctx, HlContext::Recents | HlContext::Shortcuts);
         let (pos, size, viewport, max_off, cur_off) = if horizontal {
             (
                 tx,
@@ -1365,6 +1352,21 @@ const HL_DAMPING: f32 = 52.0;
 /// Corner radius of the highlight pill (matches the rows' `rounded_lg`).
 const HL_RADIUS: f32 = 8.0;
 
+/// Font-size bounds (px) for shrink-to-fit Home card titles.
+const TITLE_MAX: f32 = 14.0;
+const TITLE_MIN: f32 = 10.0;
+/// Reserved two-line box uses this line height (px) at the largest font, so every
+/// card is the same height regardless of how far its title shrank. Actual line
+/// spacing scales with the font (see `TITLE_LINE_RATIO`).
+const TITLE_LINE: f32 = 16.0;
+/// Line height as a multiple of the title's font size (≈ `TITLE_LINE / TITLE_MAX`)
+/// so inter-line spacing shrinks together with the text.
+const TITLE_LINE_RATIO: f32 = 1.15;
+/// Footprint and corner rounding (px) shared by every Home icon tile, so a row of
+/// disparate icons reads as uniform. The radius mirrors the macOS app-icon curve.
+const ICON_SIZE: f32 = 40.0;
+const ICON_RADIUS: f32 = 9.0;
+
 /// Which navigable list the selection highlight is currently tracking. Switching
 /// lists snaps the pill rather than flying it across the panel.
 #[derive(Clone, Copy, PartialEq)]
@@ -1568,33 +1570,137 @@ fn section_label(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// A Home shortcut row: a leading icon element + title. Selection is drawn by the
-/// animated highlight pill, so the row itself only carries hover.
-fn simple_row(leading: AnyElement, title: &str, _selected: bool) -> gpui::Div {
+/// A Home strip card: a centered icon over an up-to-2-line title, fixed width so
+/// the horizontal strips (Recently opened, Shortcuts) share one tile shape. The
+/// caller attaches `.id(..)` and the click handler; selection is drawn by the
+/// animated highlight pill, so the card itself only carries hover.
+fn home_card(leading: AnyElement, title: &str) -> gpui::Div {
+    let font = title_font_px(title);
     div()
+        .flex_shrink_0()
+        .w(px(92.))
         .flex()
+        .flex_col()
         .items_center()
-        .gap_3()
-        .px_3()
+        .gap_1()
+        .px_2()
         .py_2()
-        .rounded_lg()
+        .rounded_xl()
         .hover(|s| s.bg(theme::hover()))
         .child(leading)
-        .child(div().text_color(theme::text()).child(title.to_string()))
+        .child(
+            div()
+                .w_full()
+                // Reserve two lines at the largest font so every card is the
+                // same height, then center vertically so a one-line title sits
+                // half a line lower rather than hugging the icon.
+                .h(px(TITLE_LINE * 2.))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .text_center()
+                .text_size(px(font))
+                // Line spacing tracks the font, so a shrunken two-line title packs
+                // its lines proportionally tighter instead of keeping a fixed gap.
+                .line_height(px(font * TITLE_LINE_RATIO))
+                // `line_clamp` limits the line count; `text_ellipsis` is what
+                // actually truncates the last line with an ellipsis when it
+                // still overflows (e.g. "Firefox Developer Edition").
+                .line_clamp(2)
+                .text_ellipsis()
+                .text_color(theme::text())
+                .child(title.to_string()),
+        )
 }
 
-/// A 28px cyan tile holding a glyph/emoji — the default row icon.
-fn glyph_tile(glyph: &str) -> AnyElement {
+/// Largest font size (px, between `TITLE_MIN` and `TITLE_MAX`) at which `title`
+/// word-wraps onto at most two lines inside a Home card. Short labels stay
+/// comfortably large; long ones shrink to fit before the 2-line clamp has to
+/// truncate them.
+fn title_font_px(title: &str) -> f32 {
+    // Card width (92) minus its horizontal padding; a little slack so the width
+    // estimate stays on the safe side of the real glyph advances.
+    const AVAIL: f32 = 74.0;
+    let words: Vec<usize> = title.split_whitespace().map(|w| w.chars().count()).collect();
+    let mut size = TITLE_MAX;
+    while size > TITLE_MIN {
+        if wrapped_lines(&words, AVAIL, size) <= 2 {
+            break;
+        }
+        size -= 0.5;
+    }
+    size
+}
+
+/// Greedy word-wrap line count for `words` (their char counts) rendered at `font`
+/// px within `avail` px, estimating the average glyph advance as ~0.52em.
+fn wrapped_lines(words: &[usize], avail: f32, font: f32) -> usize {
+    let cap = (avail / (font * 0.52)).floor().max(1.0) as usize;
+    let mut lines = 1;
+    let mut used = 0usize;
+    for &w in words {
+        if used == 0 {
+            used = w;
+        } else if used + 1 + w <= cap {
+            used += 1 + w; // fits after a space
+        } else {
+            lines += 1;
+            used = w; // wrap onto the next line
+        }
+    }
+    lines
+}
+
+/// Wrap icon content in the shared rounded-square tile: fixed size, app-style
+/// corner rounding, a faint neutral backing (so transparent icons and glyphs sit
+/// on a subtle tile rather than floating), and a clip so every icon — a square
+/// app icon, a circular one, a glyph — reads as the same rounded shape.
+fn icon_tile(inner: AnyElement) -> AnyElement {
     div()
-        .size(px(28.))
-        .rounded_md()
-        .bg(theme::tile())
+        .flex_shrink_0()
+        .size(px(ICON_SIZE))
+        .rounded(px(ICON_RADIUS))
+        .overflow_hidden()
+        .bg(theme::icon_bg())
         .flex()
         .items_center()
         .justify_center()
-        .text_color(theme::accent())
-        .child(glyph.to_string())
+        .child(inner)
         .into_any_element()
+}
+
+/// A `RenderImage` scaled to cover the tile, so square art fills it edge to edge.
+/// The rounding is applied to the image itself (gpui honors an image's own corner
+/// radii) — a parent's `overflow_hidden` does not clip child images to the radius.
+fn icon_fill(image: Arc<RenderImage>) -> AnyElement {
+    img(ImageSource::Render(image))
+        .w(px(ICON_SIZE))
+        .h(px(ICON_SIZE))
+        .rounded(px(ICON_RADIUS))
+        .object_fit(ObjectFit::Cover)
+        .into_any_element()
+}
+
+/// Tile for a built-in generated logo (`"clipboard"`, `"settings"`), or `None`.
+fn logo_tile(kind: &str) -> Option<AnyElement> {
+    logo::logo(kind).map(|image| icon_tile(icon_fill(image)))
+}
+
+/// Tile for an image file (e.g. an extension's logo), or `None` if unloadable.
+fn image_tile(cache: &mut HashMap<PathBuf, Arc<RenderImage>>, path: &str) -> Option<AnyElement> {
+    let image = load_image_file(cache, std::path::Path::new(path))?;
+    Some(icon_tile(icon_fill(image)))
+}
+
+/// A glyph/emoji centered on the icon tile — the fallback when there's no image.
+fn glyph_tile(glyph: &str) -> AnyElement {
+    icon_tile(
+        div()
+            .text_xl()
+            .text_color(theme::accent())
+            .child(glyph.to_string())
+            .into_any_element(),
+    )
 }
 
 /// Decode an image file (e.g. PNG) into a cached `RenderImage`, swapping
@@ -1623,30 +1729,6 @@ fn decode_image_bytes(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     }
     let buffer = image::RgbaImage::from_raw(w, h, raw)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
-}
-
-/// A leading element rendering the image at `path` at `size` px, or `None` if it
-/// can't be loaded.
-fn image_leading(
-    cache: &mut HashMap<PathBuf, Arc<RenderImage>>,
-    path: &str,
-    size: f32,
-) -> Option<AnyElement> {
-    let image = load_image_file(cache, std::path::Path::new(path))?;
-    Some(
-        div()
-            .size(px(size))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                img(ImageSource::Render(image))
-                    .w(px(size))
-                    .h(px(size))
-                    .object_fit(ObjectFit::Contain),
-            )
-            .into_any_element(),
-    )
 }
 
 /// Resolve an item's icon to a cached gpui `RenderImage`. Only `Icon::File`
@@ -1691,7 +1773,25 @@ fn resolve_icon(
 
 fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool) -> impl IntoElement {
     let accent = theme::accent();
-    let leading = if let Some(render_image) = icon {
+    // A result that opens a built-in panel (e.g. Clipboard History) uses that
+    // panel's generated logo, so search matches the Home tiles.
+    let panel_logo = match &item.action {
+        Action::OpenPanel(id) => logo::logo(id),
+        _ => None,
+    };
+    let leading = if let Some(image) = panel_logo {
+        div()
+            .size(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                img(ImageSource::Render(image))
+                    .w(px(28.))
+                    .h(px(28.))
+                    .object_fit(ObjectFit::Cover),
+            )
+    } else if let Some(render_image) = icon {
         // Real app icon (rasterized from NSWorkspace). Contain-fit so square
         // app icons don't stretch within the 28px slot; the wrapper div fixes
         // the slot size so the leading column aligns with glyph/letter tiles.
@@ -1761,45 +1861,29 @@ fn reopen_recent(recent: &Recent) {
     }
 }
 
-/// Leading icon for a recent card at `size` px: a custom image icon if present,
-/// else the system file icon (apps), else a glyph, else a clock fallback.
-fn recent_leading(
-    cache: &mut HashMap<PathBuf, Arc<RenderImage>>,
-    recent: &Recent,
-    size: f32,
-) -> AnyElement {
+/// Leading icon tile for a recent card: a built-in panel logo (e.g. Clipboard) if
+/// it points to one, else a custom image icon, else the system file icon (apps),
+/// else a glyph, else a clock fallback — all in the shared rounded tile.
+fn recent_leading(cache: &mut HashMap<PathBuf, Arc<RenderImage>>, recent: &Recent) -> AnyElement {
+    // Built-in panel logo, so a Clipboard recent matches its shortcut tile.
+    if let Some(panel) = &recent.panel {
+        if let Some(tile) = logo_tile(panel) {
+            return tile;
+        }
+    }
     // Custom extension logo (e.g. the Jira icon).
     if let Some(icon) = &recent.icon {
-        if let Some(el) = image_leading(cache, icon, size) {
-            return el;
+        if let Some(tile) = image_tile(cache, icon) {
+            return tile;
         }
     }
     // App / file system icon via NSWorkspace.
     if let Some(path) = &recent.path {
-        let icon = Some(Icon::File(PathBuf::from(path)));
-        if let Some(image) = resolve_icon(cache, &icon) {
-            return div()
-                .size(px(size))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(ImageSource::Render(image))
-                        .w(px(size))
-                        .h(px(size))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element();
+        if let Some(image) = resolve_icon(cache, &Some(Icon::File(PathBuf::from(path)))) {
+            return icon_tile(icon_fill(image));
         }
     }
-    div()
-        .size(px(size))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_2xl()
-        .child(recent.glyph.clone().unwrap_or_else(|| "🕘".to_string()))
-        .into_any_element()
+    glyph_tile(recent.glyph.as_deref().unwrap_or("🕘"))
 }
 
 /// Extract the AppKit `NSView` pointer from a gpui window, if any.

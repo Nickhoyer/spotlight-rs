@@ -16,6 +16,9 @@ raw-window-handle = "0.6"
 # Building gpui `RenderImage`s from rasterized app-icon pixels. Must match
 # gpui's `image` version so `image::Frame` is the same type instance.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Rasterize the generated SVG logos for built-in panels (Clipboard, Settings).
+# Already in the tree via gpui, so this adds no new compilation.
+resvg = "0.45"
 
 [dev-dependencies]
 env_logger = "0.11"
