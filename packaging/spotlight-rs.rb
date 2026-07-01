@@ -19,7 +19,7 @@ cask "spotlight-rs" do
   desc "Background menu-bar launcher (GPUI)"
   homepage "https://github.com/Nickhoyer/spotlight-rs"
 
-  depends_on macos: ">= :ventura" # 13.0, for SMAppService (Launch at Login)
+  depends_on macos: :ventura # 13.0+, for SMAppService (Launch at Login)
 
   app "Spotlight-rs.app"
 
