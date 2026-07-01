@@ -2,11 +2,13 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/config",
     "crates/platform-macos",
     "crates/ui",
     "crates/app",
     "extensions/apps",
     "extensions/calculator",
+    "extensions/jira",
 ]
 
 [workspace.package]
@@ -31,13 +33,25 @@ nucleo-matcher = "0.3"
 plist = "1"
 walkdir = "2"
 meval = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking HTTP client. No async runtime needed — calls run on gpui's
+# background executor. `json` pulls in serde_json round-tripping; default
+# features include rustls TLS for https://*.atlassian.net.
+ureq = { version = "2", features = ["json"] }
+# Basic-auth header encoding for the Jira API.
+base64 = "0.22"
+# macOS Keychain storage for the Jira API token in release builds.
+security-framework = "2"
 
 # Internal crates
 spotlight-core = { path = "crates/core" }
+spotlight-config = { path = "crates/config" }
 spotlight-platform-macos = { path = "crates/platform-macos" }
 spotlight-ui = { path = "crates/ui" }
 ext-apps = { path = "extensions/apps" }
 ext-calculator = { path = "extensions/calculator" }
+ext-jira = { path = "extensions/jira" }
 
 [profile.dev]
 # GPUI is heavy; a little optimization on deps keeps dev runs smooth without

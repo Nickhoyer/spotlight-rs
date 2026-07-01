@@ -6,6 +6,9 @@ use std::sync::Arc;
 pub enum Icon {
     /// A file/bundle whose system icon should be shown (e.g. an `.app`).
     File(PathBuf),
+    /// An image file (e.g. a logo PNG) rendered directly, as opposed to
+    /// [`Icon::File`] which shows the OS-provided file icon.
+    Image(PathBuf),
     /// A glyph or emoji to render directly as text.
     Glyph(String),
     /// Raw RGBA pixels with their dimensions.
