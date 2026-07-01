@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use futures::executor::block_on;
 use gpui::prelude::*;
 use gpui::{
-    div, ease_in_out, img, linear, px, size, Animation, AnimationExt as _, AnyElement, AnyView,
+    div, ease_in_out, img, linear, point, px, size, Animation, AnimationExt as _, AnyElement, AnyView,
     App, Bounds, Context, FocusHandle, ImageSource, KeyDownEvent, MouseButton, ObjectFit,
     RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
     WindowOptions,
@@ -138,6 +138,27 @@ pub struct SpotlightView {
     last_frame: Instant,
     /// Active horizontal slide between screens of different depth.
     slide: Option<Slide>,
+    /// Selection-highlight pill: current rect (content-space) + velocities, eased
+    /// toward the selected item's measured bounds each frame. `hl_ctx` tracks
+    /// which list owns it (snapped on switch); `hl_ready` gates rendering until
+    /// item bounds exist.
+    hl_x: f32,
+    hl_y: f32,
+    hl_w: f32,
+    hl_h: f32,
+    hl_vx: f32,
+    hl_vy: f32,
+    hl_vw: f32,
+    hl_vh: f32,
+    hl_ctx: Option<HlContext>,
+    hl_ready: bool,
+    /// Smooth scrolling that keeps the selection in view at the pill's speed
+    /// (GPUI's built-in `scroll_to_item` jumps). Runs only after a selection
+    /// change so it never fights mouse-wheel scrolling.
+    hl_last: Option<(HlContext, usize)>,
+    scroll_target: f32,
+    scroll_vel: f32,
+    scroll_anim: bool,
 }
 
 impl SpotlightView {
@@ -185,6 +206,20 @@ impl SpotlightView {
             cur_h: None,
             last_frame: Instant::now(),
             slide: None,
+            hl_x: 0.,
+            hl_y: 0.,
+            hl_w: 0.,
+            hl_h: 0.,
+            hl_vx: 0.,
+            hl_vy: 0.,
+            hl_vw: 0.,
+            hl_vh: 0.,
+            hl_ctx: None,
+            hl_ready: false,
+            hl_last: None,
+            scroll_target: 0.,
+            scroll_vel: 0.,
+            scroll_anim: false,
         };
         view.reset_home_sel();
 
@@ -405,11 +440,8 @@ impl SpotlightView {
             }
             (other, _) => other,
         };
-        let forward = matches!(key, "down" | "right");
-        match self.home_sel {
-            HomeSel::Recents(i) => list::peek(&self.recents_scroll, i, recents, forward),
-            HomeSel::Shortcuts(i) => list::peek(&self.shortcuts_scroll, i, shortcuts, forward),
-        }
+        // Scrolling the selection into view is handled by the animated scroll in
+        // `tick_highlight`, at the same speed as the highlight pill.
     }
 
     fn home_activate(&mut self, cx: &mut Context<Self>) {
@@ -657,14 +689,12 @@ impl SpotlightView {
             }
             "up" => {
                 self.selected = self.selected.saturating_sub(1);
-                list::peek(&self.results_scroll, self.selected, 0, false);
                 cx.notify();
             }
             "down" => {
                 let len = self.current_len();
                 if self.selected + 1 < len {
                     self.selected += 1;
-                    list::peek(&self.results_scroll, self.selected, len, true);
                     cx.notify();
                 }
             }
@@ -760,9 +790,16 @@ impl SpotlightView {
                     ))
                     .into_any_element()
             };
-            panel = panel
-                .child(div().h(px(1.)).bg(theme::divider()))
+            // Overlay the highlight pill behind the rows (first child paints
+            // underneath), positioned in the same coordinate space as the scroll
+            // viewport so it tracks scrolling.
+            let pill = self.highlight_pill(HlContext::Results, &scroll, HL_RADIUS);
+            let area = div()
+                .relative()
+                .overflow_hidden()
+                .when_some(pill, |a, p| a.child(p))
                 .child(list::faded_scroll(&scroll, false, inner));
+            panel = panel.child(div().h(px(1.)).bg(theme::divider())).child(area);
         }
 
         panel.into_any_element()
@@ -787,7 +824,6 @@ impl SpotlightView {
                 .overflow_x_scroll()
                 .track_scroll(&self.recents_scroll);
             for (i, recent) in recents.iter().take(MAX_RECENTS).enumerate() {
-                let selected = self.home_sel == HomeSel::Recents(i);
                 let entry = recent.clone();
                 strip = strip.child(
                     div()
@@ -801,7 +837,6 @@ impl SpotlightView {
                         .px_2()
                         .py_3()
                         .rounded_xl()
-                        .when(selected, |t| t.bg(theme::selected()))
                         .hover(|s| s.bg(theme::hover()))
                         .child(recent_leading(&mut self.icon_cache, recent, 40.))
                         .child(
@@ -821,7 +856,14 @@ impl SpotlightView {
                         ),
                 );
             }
-            col = col.child(strip);
+            let pill = self.highlight_pill(HlContext::Recents, &self.recents_scroll, 12.);
+            col = col.child(
+                div()
+                    .relative()
+                    .overflow_hidden()
+                    .when_some(pill, |a, p| a.child(p))
+                    .child(strip),
+            );
         }
 
         // Shortcuts — extension panels + Settings, in a vertical scroll list.
@@ -856,11 +898,18 @@ impl SpotlightView {
                 cx.listener(|this, _, _, cx| this.go_settings(cx)),
             ),
         );
-        col = col.child(list::faded_scroll(
-            &self.shortcuts_scroll,
-            false,
-            list.into_any_element(),
-        ));
+        let pill = self.highlight_pill(HlContext::Shortcuts, &self.shortcuts_scroll, HL_RADIUS);
+        col = col.child(
+            div()
+                .relative()
+                .overflow_hidden()
+                .when_some(pill, |a, p| a.child(p))
+                .child(list::faded_scroll(
+                    &self.shortcuts_scroll,
+                    false,
+                    list.into_any_element(),
+                )),
+        );
 
         col.into_any_element()
     }
@@ -950,11 +999,8 @@ impl SpotlightView {
 
     /// Advance the eased panel height toward the active screen's target and return
     /// it, requesting another frame while still moving.
-    fn tick_height(&mut self, window: &Window) -> f32 {
+    fn tick_height(&mut self, dt: f32, window: &Window) -> f32 {
         let target = self.screen_height(&self.screen);
-        let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.05);
-        self.last_frame = now;
         let h = match self.cur_h {
             None => target,
             Some(cur) => {
@@ -972,10 +1018,157 @@ impl SpotlightView {
         h
     }
 
+    /// Measured rect of item `ix` in `scroll`, in scroll-content coordinates
+    /// (scroll-invariant: the offset is applied later, at render).
+    fn item_rect(scroll: &gpui::ScrollHandle, ix: usize) -> Option<(f32, f32, f32, f32)> {
+        let b = scroll.bounds_for_item(ix)?;
+        let vb = scroll.bounds();
+        Some((
+            f32::from(b.origin.x) - f32::from(vb.origin.x),
+            f32::from(b.origin.y) - f32::from(vb.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height),
+        ))
+    }
+
+    /// The list + selected index that currently owns the highlight, if any.
+    fn hl_active(&self) -> Option<(HlContext, gpui::ScrollHandle, usize)> {
+        match &self.screen {
+            Screen::Search if !self.results.is_empty() => {
+                Some((HlContext::Results, self.results_scroll.clone(), self.selected))
+            }
+            Screen::Home => match self.home_sel {
+                HomeSel::Shortcuts(i) => {
+                    Some((HlContext::Shortcuts, self.shortcuts_scroll.clone(), i))
+                }
+                HomeSel::Recents(i) if !self.config.recents().is_empty() => {
+                    Some((HlContext::Recents, self.recents_scroll.clone(), i))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Spring the highlight pill toward the selected item's measured bounds.
+    /// Snaps (no fly) when the active list changes.
+    fn tick_highlight(&mut self, dt: f32, window: &Window) {
+        let Some((ctx, scroll, ix)) = self.hl_active() else {
+            self.hl_ctx = None;
+            self.hl_ready = false;
+            return;
+        };
+        let Some((tx, ty, tw, th)) = Self::item_rect(&scroll, ix) else {
+            // Bounds aren't painted yet; take one more frame to get them.
+            window.request_animation_frame();
+            return;
+        };
+        let ctx_changed = self.hl_ctx != Some(ctx);
+        let still = |p: f32, t: f32, v: f32| (p - t).abs() > 0.4 || v.abs() > 2.0;
+
+        // --- highlight pill: snap on list switch, otherwise spring ---
+        if ctx_changed {
+            self.hl_ctx = Some(ctx);
+            self.hl_x = tx;
+            self.hl_y = ty;
+            self.hl_w = tw;
+            self.hl_h = th;
+            self.hl_vx = 0.;
+            self.hl_vy = 0.;
+            self.hl_vw = 0.;
+            self.hl_vh = 0.;
+        } else {
+            (self.hl_x, self.hl_vx) = spring_to(self.hl_x, self.hl_vx, tx, dt);
+            (self.hl_y, self.hl_vy) = spring_to(self.hl_y, self.hl_vy, ty, dt);
+            (self.hl_w, self.hl_vw) = spring_to(self.hl_w, self.hl_vw, tw, dt);
+            (self.hl_h, self.hl_vh) = spring_to(self.hl_h, self.hl_vh, th, dt);
+            if still(self.hl_x, tx, self.hl_vx)
+                || still(self.hl_y, ty, self.hl_vy)
+                || still(self.hl_w, tw, self.hl_vw)
+                || still(self.hl_h, th, self.hl_vh)
+            {
+                window.request_animation_frame();
+            }
+        }
+        self.hl_ready = true;
+
+        // --- scroll the selection into view at the pill's speed ---
+        let horizontal = matches!(ctx, HlContext::Recents);
+        let (pos, size, viewport, max_off, cur_off) = if horizontal {
+            (
+                tx,
+                tw,
+                f32::from(scroll.bounds().size.width),
+                f32::from(scroll.max_offset().x),
+                f32::from(scroll.offset().x),
+            )
+        } else {
+            (
+                ty,
+                th,
+                f32::from(scroll.bounds().size.height),
+                f32::from(scroll.max_offset().y),
+                f32::from(scroll.offset().y),
+            )
+        };
+        let sel_changed = self.hl_last != Some((ctx, ix));
+        self.hl_last = Some((ctx, ix));
+        if ctx_changed {
+            // New list: snap scroll to reveal, no animation across lists.
+            self.scroll_anim = false;
+            self.scroll_vel = 0.;
+            let snap = reveal_offset(pos, size, viewport, cur_off, max_off);
+            scroll.set_offset(set_axis(scroll.offset(), horizontal, snap));
+        } else if sel_changed {
+            self.scroll_target = reveal_offset(pos, size, viewport, cur_off, max_off);
+            self.scroll_vel = 0.;
+            self.scroll_anim = true;
+        }
+        if self.scroll_anim {
+            let (next, vel) = spring_to(cur_off, self.scroll_vel, self.scroll_target, dt);
+            self.scroll_vel = vel;
+            scroll.set_offset(set_axis(scroll.offset(), horizontal, next));
+            if (next - self.scroll_target).abs() > 0.4 || vel.abs() > 2.0 {
+                window.request_animation_frame();
+            } else {
+                self.scroll_anim = false;
+            }
+        }
+    }
+
+    /// The highlight pill for `ctx`, positioned (content rect + current scroll
+    /// offset) as an absolute overlay. `None` when another list owns the pill or
+    /// bounds aren't ready yet.
+    fn highlight_pill(
+        &self,
+        ctx: HlContext,
+        scroll: &gpui::ScrollHandle,
+        radius: f32,
+    ) -> Option<gpui::Div> {
+        if !self.hl_ready || self.hl_ctx != Some(ctx) {
+            return None;
+        }
+        let off = scroll.offset();
+        Some(
+            div()
+                .absolute()
+                .left(px(self.hl_x + f32::from(off.x)))
+                .top(px(self.hl_y + f32::from(off.y)))
+                .w(px(self.hl_w))
+                .h(px(self.hl_h))
+                .rounded(px(radius))
+                .bg(theme::selected()),
+        )
+    }
+
     /// Build the panel body: normally `chrome(height, content)`, or a sliding
     /// two-screen track during a depth transition.
     fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let h = self.tick_height(window);
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.032);
+        self.last_frame = now;
+        self.tick_highlight(dt, window);
+        let h = self.tick_height(dt, window);
 
         let Some(slide) = self.slide.clone() else {
             let screen = self.screen.clone();
@@ -1101,6 +1294,56 @@ const RESULTS_MAX_H: f32 = 320.0;
 const HEIGHT_TAU: f32 = 0.055;
 /// Horizontal slide duration for depth changes (main ↔ settings/extension).
 const SLIDE_MS: u64 = 260;
+
+/// Spring stiffness/damping for the selection highlight. Damping is a touch below
+/// critical (2·√stiffness ≈ 63) so the pill overshoots slightly and settles —
+/// the satisfying "magic pill" glide.
+const HL_STIFFNESS: f32 = 1000.0;
+const HL_DAMPING: f32 = 52.0;
+/// Corner radius of the highlight pill (matches the rows' `rounded_lg`).
+const HL_RADIUS: f32 = 8.0;
+
+/// Which navigable list the selection highlight is currently tracking. Switching
+/// lists snaps the pill rather than flying it across the panel.
+#[derive(Clone, Copy, PartialEq)]
+enum HlContext {
+    Results,
+    Shortcuts,
+    Recents,
+}
+
+/// Semi-implicit Euler step of a 1-D spring toward `target`.
+fn spring_to(pos: f32, vel: f32, target: f32, dt: f32) -> (f32, f32) {
+    let force = HL_STIFFNESS * (target - pos) - HL_DAMPING * vel;
+    let vel = vel + force * dt;
+    (pos + vel * dt, vel)
+}
+
+/// Scroll offset (along one axis) that brings item `[pos, pos+size]` fully into a
+/// `viewport`, revealing a `peek` of the neighbor, clamped to the scroll range.
+/// Returns the GPUI offset convention (0 at top/left, negative when scrolled).
+fn reveal_offset(pos: f32, size: f32, viewport: f32, cur_off: f32, max_off: f32) -> f32 {
+    let peek = size + 8.0;
+    let mut start = -cur_off; // content coordinate currently at the viewport edge
+    if pos - peek < start {
+        start = pos - peek;
+    } else if pos + size + peek > start + viewport {
+        start = pos + size + peek - viewport;
+    }
+    // `max_off` is GPUI's positive scroll magnitude; the offset range is
+    // [-max_off, 0], so the content-start range is [0, max_off].
+    let max_start = max_off.max(0.0);
+    -start.clamp(0.0, max_start)
+}
+
+/// Replace one axis of a scroll offset point, keeping the other axis.
+fn set_axis(off: gpui::Point<gpui::Pixels>, horizontal: bool, value: f32) -> gpui::Point<gpui::Pixels> {
+    if horizontal {
+        point(px(value), off.y)
+    } else {
+        point(off.x, px(value))
+    }
+}
 
 /// An in-progress horizontal slide between screens of different depth. The height
 /// is handled separately by the continuous height easing.
@@ -1263,8 +1506,9 @@ fn section_label(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// A Home shortcut row: a leading icon element + title.
-fn simple_row(leading: AnyElement, title: &str, selected: bool) -> gpui::Div {
+/// A Home shortcut row: a leading icon element + title. Selection is drawn by the
+/// animated highlight pill, so the row itself only carries hover.
+fn simple_row(leading: AnyElement, title: &str, _selected: bool) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -1272,7 +1516,6 @@ fn simple_row(leading: AnyElement, title: &str, selected: bool) -> gpui::Div {
         .px_3()
         .py_2()
         .rounded_lg()
-        .when(selected, |this| this.bg(theme::selected()))
         .hover(|s| s.bg(theme::hover()))
         .child(leading)
         .child(div().text_color(theme::text()).child(title.to_string()))
@@ -1378,7 +1621,7 @@ fn resolve_icon(
     Some(render_image)
 }
 
-fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, selected: bool) -> impl IntoElement {
+fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool) -> impl IntoElement {
     let accent = theme::accent();
     let leading = if let Some(render_image) = icon {
         // Real app icon (rasterized from NSWorkspace). Contain-fit so square
@@ -1424,7 +1667,6 @@ fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, selected: bool)
         .px_3()
         .py_2()
         .rounded_lg()
-        .when(selected, |this| this.bg(theme::selected()))
         .child(leading)
         .child(
             div()
