@@ -19,6 +19,10 @@ concurrency:
 jobs:
   release:
     runs-on: macos-14
+    env:
+      # Exposed at job level so steps can gate on its presence (a missing token
+      # skips the cask bump instead of failing the whole release).
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -83,15 +87,15 @@ jobs:
           gh release create "v$V" dist/Spotlight-rs.zip --title "v$V" --generate-notes
 
       - name: Checkout Homebrew tap
-        if: steps.ver.outputs.release == 'true'
+        if: steps.ver.outputs.release == 'true' && env.TAP_TOKEN != ''
         uses: actions/checkout@v5
         with:
           repository: Nickhoyer/homebrew-tap
-          token: ${{ secrets.TAP_TOKEN }}
+          token: ${{ env.TAP_TOKEN }}
           path: tap
 
       - name: Bump cask in tap
-        if: steps.ver.outputs.release == 'true'
+        if: steps.ver.outputs.release == 'true' && env.TAP_TOKEN != ''
         run: |
           V="${{ steps.ver.outputs.version }}"
           SHA="$(shasum -a 256 dist/Spotlight-rs.zip | awk '{print $1}')"
