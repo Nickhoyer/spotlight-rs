@@ -1,0 +1,133 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Spotlight logo">
+  <defs>
+    <linearGradient id="bg" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0E1621"/>
+      <stop offset="1" stop-color="#070A0F"/>
+    </linearGradient>
+
+    <radialGradient id="apexGlow" cx="118" cy="118" r="205" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8FE9FB" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#59C9EA" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#59C9EA" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="beam" x1="118" y1="118" x2="360" y2="455" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#EDFEFF"/>
+      <stop offset="0.18" stop-color="#B5F2FB"/>
+      <stop offset="0.50" stop-color="#4EDDF1"/>
+      <stop offset="0.80" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#12B2D6"/>
+    </linearGradient>
+
+    <radialGradient id="lens" cx="320" cy="310" r="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#05131C" stop-opacity="0.88"/>
+      <stop offset="0.55" stop-color="#06151F" stop-opacity="0.82"/>
+      <stop offset="0.85" stop-color="#08192B" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#08192B" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="gloss" cx="295" cy="259" r="113" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.09"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="coreSheen" x1="150" y1="150" x2="300" y2="290" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.28" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="0.7" stop-color="#FFFFFF" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="caustic" x1="445.6" y1="343.6" x2="207.4" y2="375" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#EAFEFF" stop-opacity="0"/>
+      <stop offset="0.30" stop-color="#EAFEFF" stop-opacity="0.90"/>
+      <stop offset="0.62" stop-color="#7FE9F8" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#7FE9F8" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="edgeLight" x1="118" y1="118" x2="400" y2="470" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.90"/>
+      <stop offset="0.5" stop-color="#9EEFFA" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#EAFEFF" stop-opacity="0.85"/>
+    </linearGradient>
+
+    <linearGradient id="edge" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#B8ECFA" stop-opacity="0.22"/>
+      <stop offset="0.30" stop-color="#B8ECFA" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#B8ECFA" stop-opacity="0"/>
+    </linearGradient>
+
+    <clipPath id="clip">
+      <path d="M112,0 H400 A112,112 0 0 1 512,112 V400 A112,112 0 0 1 400,512 H112 A112,112 0 0 1 0,400 V112 A112,112 0 0 1 112,0 Z"/>
+    </clipPath>
+    <clipPath id="sil">
+      <path d="M118,118 L353.04,176.02 A138,138 0 1 1 187.82,349.68 Z"/>
+    </clipPath>
+
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="18"/></filter>
+    <filter id="midGlow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="9"/></filter>
+    <filter id="barGlow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="5"/></filter>
+    <filter id="apexBlur" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="11"/></filter>
+    <filter id="starBlur" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="2.6"/></filter>
+    <filter id="glossBlur" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="11"/></filter>
+  </defs>
+
+  <!-- base plate -->
+  <path d="M112,0 H400 A112,112 0 0 1 512,112 V400 A112,112 0 0 1 400,512 H112 A112,112 0 0 1 0,400 V112 A112,112 0 0 1 112,0 Z" fill="url(#bg)"/>
+
+  <g clip-path="url(#clip)">
+    <!-- ambient light spilling from the source -->
+    <rect x="0" y="0" width="512" height="512" fill="url(#apexGlow)"/>
+
+    <!-- straight beam -> pool: outer glow -->
+    <path d="M118,118 L353.04,176.02 A138,138 0 1 1 187.82,349.68 Z" fill="#22D3EE" opacity="0.5" filter="url(#softGlow)"/>
+
+    <!-- straight beam -> pool: glass body -->
+    <path d="M118,118 L353.04,176.02 A138,138 0 1 1 187.82,349.68 Z" fill="url(#beam)"/>
+
+    <!-- everything below is clipped to the glass so it refracts inside the shape -->
+    <g clip-path="url(#sil)">
+      <!-- recessed lens / search field -->
+      <circle cx="320" cy="310" r="116" fill="url(#lens)"/>
+
+      <!-- wet core highlight running straight down the beam -->
+      <path d="M150,150 L300,290" fill="none" stroke="url(#coreSheen)" stroke-width="36" stroke-linecap="round" filter="url(#glossBlur)"/>
+
+      <!-- glossy sheen over the top of the pool -->
+      <ellipse cx="295" cy="259" rx="113" ry="68" fill="url(#gloss)"/>
+
+      <!-- refracted caustic along the lower rim where the beam pools -->
+      <path d="M445.6,343.6 A130,130 0 0 1 207.4,375" fill="none" stroke="url(#caustic)" stroke-width="12" stroke-linecap="round" filter="url(#midGlow)"/>
+      <path d="M445.6,343.6 A130,130 0 0 1 207.4,375" fill="none" stroke="url(#caustic)" stroke-width="4" stroke-linecap="round"/>
+
+      <!-- result lines caught in the light (horizontal, brightest in the middle) -->
+      <g filter="url(#barGlow)" opacity="0.7">
+        <rect x="264" y="265" width="104" height="18" rx="9" fill="#1FB6D2"/>
+        <rect x="264" y="301" width="130" height="18" rx="9" fill="#EFFEFF"/>
+        <rect x="264" y="338" width="79" height="18" rx="9" fill="#23C9E4"/>
+      </g>
+      <rect x="264" y="265" width="104" height="18" rx="9" fill="#1CAAC6"/>
+      <rect x="264" y="301" width="130" height="18" rx="9" fill="#F2FEFF"/>
+      <rect x="264" y="338" width="79" height="18" rx="9" fill="#24CFEA"/>
+
+      <!-- edge light wrapping the whole contour (inner half of stroke) -->
+      <path d="M118,118 L353.04,176.02 A138,138 0 1 1 187.82,349.68 Z" fill="none" stroke="url(#edgeLight)" stroke-width="7"/>
+
+      <!-- crisp specular glint on the upper-left rim -->
+      <ellipse cx="232" cy="255" rx="24" ry="11" fill="#FFFFFF" opacity="0.55" transform="rotate(-34 232 255)" filter="url(#starBlur)"/>
+    </g>
+
+    <!-- light source: glow, lens-flare star, hot core -->
+    <circle cx="118" cy="118" r="34" fill="#6FE8FA" opacity="0.5" filter="url(#apexBlur)"/>
+    <g filter="url(#starBlur)" fill="#EFFEFF" opacity="0.6">
+      <path d="M59,118 L118,114 L177,118 L118,122 Z"/>
+      <path d="M118,73 L122,118 L118,163 L114,118 Z"/>
+    </g>
+    <circle cx="118" cy="118" r="11" fill="#F2FEFF"/>
+    <circle cx="118" cy="118" r="5" fill="#FFFFFF"/>
+  </g>
+
+  <!-- glass edge highlight -->
+  <path d="M112,0 H400 A112,112 0 0 1 512,112 V400 A112,112 0 0 1 400,512 H112 A112,112 0 0 1 0,400 V112 A112,112 0 0 1 112,0 Z" fill="none" stroke="url(#edge)" stroke-width="2"/>
+</svg>
