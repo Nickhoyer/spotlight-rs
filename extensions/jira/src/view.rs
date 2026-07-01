@@ -287,6 +287,7 @@ impl JiraView {
             path: None,
             icon: Some(crate::icon_path()),
             glyph: Some("🪐".to_string()),
+            panel: None,
         });
         let _ = cfg.save();
     }

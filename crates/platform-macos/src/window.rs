@@ -67,25 +67,24 @@ pub fn panel_visible(ns_view: *mut c_void) -> bool {
     }
 }
 
-/// Show the panel: bring the app forward and make the window key. Safe to call
+/// Show the panel and make it key so it receives keystrokes. Safe to call
 /// repeatedly or when already visible. Must be called on the main thread.
+///
+/// We deliberately do NOT call `activateIgnoringOtherApps:` — that would make our
+/// app the active app and steal focus from whatever the user was typing in.
+/// gpui's `WindowKind::PopUp` is a non-activating `NSPanel`, which can become the
+/// key window (and take keyboard input) while the previous app stays active, so
+/// hiding the panel returns focus to that app — the behavior a paste-back needs.
 pub fn show_panel(ns_view: *mut c_void) {
     if ns_view.is_null() {
         return;
     }
-    // SAFETY: well-known AppKit messages on the window and NSApp singleton.
+    // SAFETY: well-known AppKit messages on the window.
     unsafe {
         let view = ns_view as *mut Object;
         let window: *mut Object = msg_send![view, window];
         if window.is_null() {
             return;
-        }
-        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-        if !app.is_null() {
-            const YES: i8 = 1;
-            // With accessory policy there's no Dock click to activate us, so we
-            // explicitly activate to ensure the panel can take keyboard focus.
-            let _: () = msg_send![app, activateIgnoringOtherApps: YES];
         }
         let nil: *mut Object = std::ptr::null_mut();
         let _: () = msg_send![window, makeKeyAndOrderFront: nil];

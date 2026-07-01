@@ -1729,6 +1729,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext-clipboard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "gpui",
+ "ring",
+ "serde",
+ "serde_json",
+ "spotlight-config",
+ "spotlight-core",
+ "spotlight-platform-macos",
+ "spotlight-ui",
+]
+
+[[package]]
 name = "ext-jira"
 version = "0.1.0"
 dependencies = [
@@ -5286,6 +5303,7 @@ version = "0.1.0"
 dependencies = [
  "ext-apps",
  "ext-calculator",
+ "ext-clipboard",
  "ext-jira",
  "spotlight-core",
  "spotlight-ui",
@@ -5316,6 +5334,7 @@ name = "spotlight-platform-macos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.9.4",
  "core-graphics 0.24.0",
  "image",
  "objc",

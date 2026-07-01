@@ -16,7 +16,7 @@ mod settings;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,9 @@ use futures::executor::block_on;
 use gpui::prelude::*;
 use gpui::{
     div, ease_in_out, img, linear, point, px, size, Animation, AnimationExt as _, AnyElement, AnyView,
-    App, Bounds, Context, FocusHandle, ImageSource, KeyDownEvent, MouseButton, ObjectFit,
-    RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions,
+    App, Bounds, ClipboardItem, Context, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
+    ObjectFit, RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions,
 };
 
 use spotlight_config::{AppConfig, Recent};
@@ -41,6 +41,28 @@ const MAX_RECENTS: usize = 5;
 /// CoreGraphics window number of the launcher window, published once the window
 /// exists so the debug capture thread (see [`run`]) can grab it. Zero until set.
 static CAPTURE_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+/// Set by [`hide_launcher_window`] so the next window-deactivation (which the
+/// order-out itself triggers) is swallowed rather than kicking off a second,
+/// animated hide. Cleared when consumed.
+static SUPPRESS_ACTIVATION_HIDE: AtomicBool = AtomicBool::new(false);
+
+/// Hide the launcher immediately from within an extension panel (e.g. after
+/// copying a clipboard entry). Orders the panel out and suppresses the redundant
+/// activation-driven hide that would otherwise fire.
+pub fn hide_launcher_window(window: &Window) {
+    if let Some(ns_view) = appkit_view_ptr(window) {
+        SUPPRESS_ACTIVATION_HIDE.store(true, Ordering::SeqCst);
+        spotlight_platform_macos::window::hide_panel(ns_view);
+    }
+}
+
+/// Decode PNG bytes into a cached-ready gpui [`RenderImage`], reordering
+/// RGBA→BGRA to match gpui's byte order. Lets extension panels render images
+/// (e.g. clipboard image previews) without duplicating the pixel plumbing.
+pub fn render_image_from_png_bytes(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    decode_image_bytes(bytes)
+}
 
 /// A full-screen panel contributed by an extension (e.g. the Jira task list).
 /// Surfaced as a shortcut on Home and rendered when navigated to.
@@ -233,6 +255,12 @@ impl SpotlightView {
                     return;
                 }
                 if !window.is_window_active() {
+                    // A panel dismissing itself (clipboard copy) already ordered
+                    // the window out; swallow the resulting deactivation so we
+                    // don't play a second, animated hide over the hidden panel.
+                    if SUPPRESS_ACTIVATION_HIDE.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
                     view.hide(window, cx);
                 }
             })
@@ -306,11 +334,26 @@ impl SpotlightView {
         let Some(entry) = self.ui.panels.iter().find(|p| p.id == id) else {
             return;
         };
+        // Snapshot what we need for the recents entry before the borrows below.
+        let title = entry.title.clone();
+        let glyph = entry.glyph.clone();
+        let icon = entry.icon.clone();
         let from = self.screen.clone();
         let view = (entry.make_view)(cx);
         self.panel = Some(view);
         self.screen = Screen::Extension(id.to_string());
         self.selected = 0;
+        // Record the open so the panel shows up (and ranks) in recents/search.
+        self.persist_use(Recent {
+            id: format!("panel:{id}"),
+            title,
+            subtitle: None,
+            url: None,
+            path: None,
+            icon,
+            glyph: Some(glyph),
+            panel: Some(id.to_string()),
+        });
         self.maybe_slide(from);
         cx.notify();
     }
@@ -462,7 +505,7 @@ impl SpotlightView {
         }
     }
 
-    fn activate_search(&mut self, cx: &mut Context<Self>) {
+    fn activate_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.results.get(self.selected).cloned() else {
             return;
         };
@@ -475,7 +518,19 @@ impl SpotlightView {
                 open_url(url);
                 self.record_activation(&item);
             }
-            Action::Copy(_text) => { /* TODO: clipboard integration */ }
+            Action::Copy(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                // Copying leaves us focused (nothing else came forward), so
+                // dismiss explicitly the way opening an app/url does implicitly.
+                self.hide(window, cx);
+                return;
+            }
+            Action::OpenPanel(id) => {
+                // Navigate into the panel (which records its own recents entry).
+                let id = id.clone();
+                self.go_panel(&id, cx);
+                return;
+            }
             Action::Custom(id) => {
                 if let Some(ext) = self.registry.owner(&item.source) {
                     let _ = ext.run(id);
@@ -512,11 +567,18 @@ impl SpotlightView {
             path,
             icon,
             glyph,
+            panel: None,
         });
     }
 
-    /// Re-open a recent (URL or path) and record the use so it ranks higher.
+    /// Re-open a recent: navigate into an extension panel, or open a URL/path.
+    /// (`go_panel` records its own use, so panels don't also persist here.)
     fn reopen_and_record(&mut self, recent: Recent, cx: &mut Context<Self>) {
+        if let Some(panel) = &recent.panel {
+            let id = panel.clone();
+            self.go_panel(&id, cx);
+            return;
+        }
         reopen_recent(&recent);
         self.persist_use(recent);
         cx.notify();
@@ -698,7 +760,7 @@ impl SpotlightView {
                     cx.notify();
                 }
             }
-            "enter" => self.activate_search(cx),
+            "enter" => self.activate_search(window, cx),
             _ => {
                 if !modifiers.platform && !modifiers.control {
                     if let Some(ch) = &event.keystroke.key_char {
@@ -1545,16 +1607,22 @@ fn load_image_file(
         return Some(cached.clone());
     }
     let bytes = std::fs::read(path).ok()?;
-    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let render = decode_image_bytes(&bytes)?;
+    cache.insert(path.to_path_buf(), render.clone());
+    Some(render)
+}
+
+/// Decode encoded image bytes (PNG/etc.) into a gpui `RenderImage`, reordering
+/// RGBA→BGRA to match gpui's byte order.
+fn decode_image_bytes(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = decoded.dimensions();
     let mut raw = decoded.into_raw();
     for px in raw.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
     let buffer = image::RgbaImage::from_raw(w, h, raw)?;
-    let render = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-    cache.insert(path.to_path_buf(), render.clone());
-    Some(render)
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 /// A leading element rendering the image at `path` at `size` px, or `None` if it

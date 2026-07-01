@@ -28,6 +28,9 @@ pub enum Action {
     OpenUrl(String),
     /// Copy text to the clipboard.
     Copy(String),
+    /// Navigate to a full-screen extension panel by its id (e.g. open the
+    /// Clipboard History panel from a search result).
+    OpenPanel(String),
     /// An extension-specific action, dispatched back to its owning extension's
     /// [`Extension::run`] with this id.
     Custom(String),

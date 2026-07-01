@@ -11,5 +11,8 @@ walkdir.workspace = true
 objc = "0.2"
 # Debug self-capture of our own window (CGWindowListCreateImage -> PNG), and
 # rasterizing app icons via NSWorkspace (NSImage -> NSBitmapImageRep -> RGBA).
+# Also CGEvent for synthesizing the paste (⌘V) keystroke.
 core-graphics = "0.24"
+# Building the options dict for the Accessibility-permission prompt.
+core-foundation = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }

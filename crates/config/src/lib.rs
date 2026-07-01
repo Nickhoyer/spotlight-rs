@@ -62,6 +62,10 @@ pub struct Recent {
     /// Optional leading glyph/emoji (used when there's no image/`path` icon).
     #[serde(default)]
     pub glyph: Option<String>,
+    /// If set, re-opening navigates to this extension panel by id (rather than
+    /// opening a url/path). Lets panels like Clipboard History appear in recents.
+    #[serde(default)]
+    pub panel: Option<String>,
 }
 
 /// Cap on the raw usage-history log (kept with duplicates for frecency).
@@ -231,6 +235,7 @@ mod tests {
             path: None,
             icon: None,
             glyph: None,
+            panel: None,
         }
     }
 

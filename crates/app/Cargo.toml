@@ -13,4 +13,5 @@ spotlight-core.workspace = true
 spotlight-ui.workspace = true
 ext-apps.workspace = true
 ext-calculator.workspace = true
+ext-clipboard.workspace = true
 ext-jira.workspace = true

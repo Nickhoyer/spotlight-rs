@@ -8,6 +8,7 @@ members = [
     "crates/app",
     "extensions/apps",
     "extensions/calculator",
+    "extensions/clipboard",
     "extensions/jira",
 ]
 
@@ -51,6 +52,7 @@ spotlight-platform-macos = { path = "crates/platform-macos" }
 spotlight-ui = { path = "crates/ui" }
 ext-apps = { path = "extensions/apps" }
 ext-calculator = { path = "extensions/calculator" }
+ext-clipboard = { path = "extensions/clipboard" }
 ext-jira = { path = "extensions/jira" }
 
 [profile.dev]
