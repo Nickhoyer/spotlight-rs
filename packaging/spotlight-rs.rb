@@ -12,12 +12,12 @@
 # The `quarantine` stanza below asks Homebrew to strip the attribute on install.
 cask "spotlight-rs" do
   version "0.1.0"
-  sha256 "REPLACE_WITH_SHASUM_OF_ZIP"
+  sha256 "1b3fbc3562163346e488716d25ad9c036083c1d295820071870e3be81ddfe7f1"
 
-  url "https://github.com/nickolashoyer/spotlight-rs/releases/download/v#{version}/Spotlight-rs.zip"
+  url "https://github.com/Nickhoyer/spotlight-rs/releases/download/v#{version}/Spotlight-rs.zip"
   name "Spotlight-rs"
   desc "Background menu-bar launcher (GPUI)"
-  homepage "https://github.com/nickolashoyer/spotlight-rs"
+  homepage "https://github.com/Nickhoyer/spotlight-rs"
 
   depends_on macos: ">= :ventura" # 13.0, for SMAppService (Launch at Login)
 
