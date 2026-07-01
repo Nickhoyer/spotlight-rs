@@ -8,6 +8,21 @@ use spotlight_core::Registry;
 use spotlight_ui::UiExtensions;
 
 fn main() {
+    // Packaging hook: `spotlight --emit-iconset <dir>` renders the app-logo
+    // iconset PNGs into <dir> and exits (scripts/bundle.sh feeds them to
+    // `iconutil`). Handled before any GUI/AppKit setup.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--emit-iconset") {
+        let dir = args.get(pos + 1).map(String::as_str).unwrap_or(".");
+        match spotlight_ui::emit_iconset(std::path::Path::new(dir)) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("spotlight: --emit-iconset failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // The clipboard extension owns a shared, encrypted history store and starts
     // its background monitor here; its search/panel/settings all read from it.
     let clipboard = ext_clipboard::Clipboard::new();
@@ -20,10 +35,12 @@ fn main() {
     // Clipboard history is searchable from the main bar (keyword: `clip`).
     registry.register(clipboard.extension());
 
-    // GPUI-aware extensions (panels + settings tabs) are wired here.
+    // GPUI-aware extensions (panels + settings tabs + menu-bar items) are wired
+    // here.
     let ui = UiExtensions {
         panels: vec![ext_jira::panel_entry(), clipboard.panel_entry()],
         settings_tabs: vec![ext_jira::settings_tab(), clipboard.settings_tab()],
+        menu_items: clipboard.menu_items(),
     };
 
     spotlight_ui::run(registry, ui);

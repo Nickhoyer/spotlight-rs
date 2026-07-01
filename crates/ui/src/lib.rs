@@ -15,6 +15,8 @@ pub mod theme;
 mod logo;
 mod settings;
 
+pub use logo::emit_iconset;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -85,12 +87,23 @@ pub struct SettingsTabFactory {
     pub make_view: Box<dyn Fn(&mut App) -> AnyView>,
 }
 
+/// A menu-bar item contributed by an extension. The action runs on the main
+/// thread with a gpui [`App`] context (bridged from the native menu click), so it
+/// can touch config, spawn tasks, or quit — mirroring [`PanelEntry`].
+pub struct MenuItem {
+    pub title: String,
+    pub action: Box<dyn Fn(&mut App)>,
+}
+
 /// GPUI-aware extension registrations, passed to [`run`] alongside the
 /// (GPUI-free) [`Registry`].
 #[derive(Default)]
 pub struct UiExtensions {
     pub panels: Vec<PanelEntry>,
     pub settings_tabs: Vec<SettingsTabFactory>,
+    /// Extra entries added to the menu-bar menu (between the built-in
+    /// Open/Settings and Launch-at-Login/Quit items).
+    pub menu_items: Vec<MenuItem>,
 }
 
 /// Which screen the launcher is currently showing.
@@ -1961,6 +1974,16 @@ pub fn run(registry: Registry, ui: UiExtensions) {
         })
         .detach();
 
+        // Menu-bar items are consumed here, not by the view, so take them out
+        // before `ui` (non-Clone) moves into the window builder below.
+        let mut ui = ui;
+        let menu_items = std::mem::take(&mut ui.menu_items);
+
+        // A background menu-bar app starts hidden and is summoned by the hotkey or
+        // the "Open Spotlight" menu item — it should not slam a window open on
+        // launch. Headless capture is the exception: it needs the window on screen.
+        let show_on_launch = std::env::var_os("SPOTLIGHT_CAPTURE").is_some();
+
         // Window is larger than the 680px resting panel so the animations have
         // transparent margin to bleed into rather than clipping at the window
         // edge: width for the open spring's ~1.2× stretch plus blur, and height
@@ -1976,8 +1999,8 @@ pub fn run(registry: Registry, ui: UiExtensions) {
                     is_movable: false,
                     is_resizable: false,
                     is_minimizable: false,
-                    focus: true,
-                    show: true,
+                    focus: show_on_launch,
+                    show: show_on_launch,
                     ..Default::default()
                 },
                 move |window, cx| cx.new(|cx| SpotlightView::new(registry, ui, window, cx)),
@@ -1985,7 +2008,119 @@ pub fn run(registry: Registry, ui: UiExtensions) {
             .expect("failed to open launcher window");
 
         register_global_hotkey(cx, window_handle);
+        install_status_bar(cx, window_handle, menu_items);
     });
+}
+
+/// Ensure the launcher panel is on screen (used by the "Open Spotlight" menu
+/// command). No-op if it's already visible.
+impl SpotlightView {
+    fn ensure_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ns_view) = appkit_view_ptr(window) {
+            if self.exiting || !spotlight_platform_macos::window::panel_visible(ns_view) {
+                self.reveal(ns_view, window, cx);
+            }
+        }
+    }
+}
+
+/// Install the menu-bar (`NSStatusItem`) control: a template glyph whose menu
+/// exposes Open/Settings, extension-contributed items, Launch at Login, and Quit.
+/// Skipped under headless capture so screenshot runs don't touch the menu bar.
+fn install_status_bar(
+    cx: &mut App,
+    window_handle: WindowHandle<SpotlightView>,
+    menu_items: Vec<MenuItem>,
+) {
+    use spotlight_platform_macos::login_item;
+    use spotlight_platform_macos::statusbar::{MenuItem as NativeItem, StatusBar};
+
+    if std::env::var_os("SPOTLIGHT_CAPTURE").is_some() {
+        return;
+    }
+
+    // 2× the ~18pt menu-bar glyph so it stays crisp; template image tints itself.
+    let Some((w, h, rgba)) = logo::menubar_icon_rgba(36) else {
+        eprintln!("spotlight: failed to rasterize menu-bar icon; status item skipped");
+        return;
+    };
+
+    let async_cx = cx.to_async();
+
+    // Run `f(view, window, cx)` against the launcher window, deferred to a safe
+    // point in the run loop (menu clicks arrive on the main thread mid-cycle).
+    let window_action = move |f: fn(&mut SpotlightView, &mut Window, &mut Context<SpotlightView>)| {
+        let cx = async_cx.clone();
+        Box::new(move || {
+            let handle = window_handle;
+            cx.spawn(async move |cx| {
+                let _ = handle.update(cx, |view, window, cx| f(view, window, cx));
+            })
+            .detach();
+        }) as Box<dyn Fn()>
+    };
+
+    let mut items: Vec<NativeItem> = vec![
+        NativeItem::Action {
+            title: "Open Spotlight".into(),
+            checked: None,
+            on_click: window_action(|view, window, cx| view.ensure_visible(window, cx)),
+        },
+        NativeItem::Action {
+            title: "Settings…".into(),
+            checked: None,
+            on_click: window_action(|view, window, cx| {
+                view.ensure_visible(window, cx);
+                view.go_settings(cx);
+            }),
+        },
+    ];
+
+    // Extension-contributed items, bridged from `Fn(&mut App)` to a main-thread
+    // click that defers into gpui.
+    for item in menu_items {
+        let action: Arc<dyn Fn(&mut App)> = Arc::from(item.action);
+        let cx = cx.to_async();
+        items.push(NativeItem::Separator);
+        items.push(NativeItem::Action {
+            title: item.title,
+            checked: None,
+            on_click: Box::new(move || {
+                let (cx, action) = (cx.clone(), action.clone());
+                cx.spawn(async move |cx| {
+                    cx.update(|cx| action(cx));
+                })
+                .detach();
+            }),
+        });
+    }
+
+    items.push(NativeItem::Separator);
+    items.push(NativeItem::Action {
+        title: "Launch at Login".into(),
+        checked: Some(Box::new(login_item::is_enabled)),
+        on_click: Box::new(|| {
+            if let Err(e) = login_item::set_enabled(!login_item::is_enabled()) {
+                eprintln!("spotlight: {e}");
+            }
+        }),
+    });
+
+    let quit_cx = cx.to_async();
+    items.push(NativeItem::Action {
+        title: "Quit Spotlight-rs".into(),
+        checked: None,
+        on_click: Box::new(move || {
+            let cx = quit_cx.clone();
+            cx.spawn(async move |cx| {
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }),
+    });
+
+    // Keep the status item alive for the whole session (like the hotkey).
+    Box::leak(Box::new(StatusBar::new(&rgba, w, h, items)));
 }
 
 /// Register the system-wide hotkey that summons the launcher. The hotkey fires

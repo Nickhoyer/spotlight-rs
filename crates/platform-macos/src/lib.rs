@@ -11,4 +11,6 @@ pub mod clipboard;
 pub mod hotkey;
 pub mod input;
 pub mod icons;
+pub mod login_item;
+pub mod statusbar;
 pub mod window;

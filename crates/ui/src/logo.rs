@@ -5,6 +5,7 @@
 //! real icons so they share the tile's size and corner rounding.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::RenderImage;
@@ -12,6 +13,58 @@ use resvg::{tiny_skia, usvg};
 
 /// Rasterize at 2× the on-screen slot so the logos stay crisp on retina.
 const RASTER_PX: u32 = 96;
+
+/// The full app logo (colored) and the monochrome menu-bar template glyph, kept
+/// alongside the code so bundling and the status-bar icon need no runtime assets.
+const APP_LOGO_SVG: &str = include_str!("../../../assets/logo.svg");
+const MENUBAR_SVG: &str = include_str!("../../../assets/logo-menubar.svg");
+
+/// Render the menu-bar template glyph to premultiplied RGBA at `size`×`size`.
+/// Returns `(width, height, rgba)`. The status bar builds an `NSImage` from this
+/// and flags it as a template so macOS tints it for the current menu-bar theme.
+pub fn menubar_icon_rgba(size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let pixmap = render_svg(MENUBAR_SVG, size)?;
+    Some((size, size, pixmap.data().to_vec()))
+}
+
+/// Write the standard macOS `.iconset` PNGs for the app logo into `out_dir`
+/// (which must exist). `iconutil -c icns` turns the result into `AppIcon.icns`.
+pub fn emit_iconset(out_dir: &Path) -> std::io::Result<()> {
+    // (point size, scale) → Apple's iconset file-name convention.
+    const VARIANTS: &[(u32, u32)] = &[
+        (16, 1),
+        (16, 2),
+        (32, 1),
+        (32, 2),
+        (128, 1),
+        (128, 2),
+        (256, 1),
+        (256, 2),
+        (512, 1),
+        (512, 2),
+    ];
+    for &(pt, scale) in VARIANTS {
+        let px = pt * scale;
+        let png = render_svg(APP_LOGO_SVG, px)
+            .and_then(|p| p.encode_png().ok())
+            .ok_or_else(|| std::io::Error::other(format!("render logo @{px}px failed")))?;
+        let suffix = if scale == 2 { "@2x" } else { "" };
+        std::fs::write(out_dir.join(format!("icon_{pt}x{pt}{suffix}.png")), png)?;
+    }
+    Ok(())
+}
+
+/// Rasterize `svg` into a `size`×`size` tiny_skia pixmap (premultiplied RGBA),
+/// scaling the SVG's viewBox to fill the square.
+fn render_svg(svg: &str, size: u32) -> Option<tiny_skia::Pixmap> {
+    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
+    let s = tree.size();
+    let transform =
+        tiny_skia::Transform::from_scale(size as f32 / s.width(), size as f32 / s.height());
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Some(pixmap)
+}
 
 /// Return the cached rasterized logo for `kind` (`"clipboard"` or `"settings"`),
 /// or `None` for an unknown kind / rasterization failure.
@@ -39,12 +92,7 @@ pub fn logo(kind: &str) -> Option<Arc<RenderImage>> {
 /// premultiplied RGBA; gpui's `RenderImage` wants straight-alpha BGRA (the same
 /// convention `resolve_icon` targets), so we un-premultiply and swap R/B.
 fn rasterize(svg: &str, size: u32) -> Option<RenderImage> {
-    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
-    let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
-    let s = tree.size();
-    let transform =
-        tiny_skia::Transform::from_scale(size as f32 / s.width(), size as f32 / s.height());
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let pixmap = render_svg(svg, size)?;
 
     let src = pixmap.data();
     let mut out = vec![0u8; src.len()];

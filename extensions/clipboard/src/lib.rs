@@ -22,7 +22,7 @@ use gpui::AppContext as _;
 use serde::{Deserialize, Serialize};
 use spotlight_config::AppConfig;
 use spotlight_core::Extension;
-use spotlight_ui::{PanelEntry, SettingsTabFactory};
+use spotlight_ui::{MenuItem, PanelEntry, SettingsTabFactory};
 
 use crate::search::ClipboardSearch;
 use crate::settings_tab::ClipboardSettingsTab;
@@ -98,6 +98,16 @@ impl Clipboard {
                 cx.new(|cx| ClipboardView::new(store, cx)).into()
             }),
         }
+    }
+
+    /// Menu-bar items contributed to the launcher's status menu. Demonstrates
+    /// the extension menu API; the closure captures the shared store.
+    pub fn menu_items(&self) -> Vec<MenuItem> {
+        let store = self.store.clone();
+        vec![MenuItem {
+            title: "Clear Clipboard History".to_string(),
+            action: Box::new(move |_cx| store.clear()),
+        }]
     }
 
     /// The "Clipboard" settings tab.
