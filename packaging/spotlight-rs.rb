@@ -30,7 +30,5 @@ cask "spotlight-rs" do
                    sudo: false
   end
 
-  zap trash: [
-    "~/Library/Application Support/spotlight-rs",
-  ]
+  zap trash: "~/Library/Application Support/spotlight-rs"
 end
