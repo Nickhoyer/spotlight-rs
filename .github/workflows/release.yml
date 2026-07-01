@@ -1,0 +1,105 @@
+name: release
+
+# Release on push to main. If there are Conventional-Commit changes since the
+# last tag that warrant a release (feat / fix / perf / breaking), compute the next
+# version, tag it, build the app on a macOS runner, publish a GitHub release, and
+# bump the Homebrew cask in the tap. Pushes with only chore/docs/ci/etc. do
+# nothing. macOS runners are free for public repos.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags, to compute the version
+
+      - name: Determine next version
+        id: ver
+        run: |
+          set -euo pipefail
+          last="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          if [ -n "$last" ]; then range="$last..HEAD"; base="${last#v}"; else range="HEAD"; base="0.0.0"; fi
+          subjects="$(git log --format='%s' "$range" || true)"
+          if git log --format='%B' "$range" | grep -qE '^BREAKING CHANGE' \
+             || printf '%s\n' "$subjects" | grep -qE '^[a-z]+(\(.+\))?!:'; then
+            level=major
+          elif printf '%s\n' "$subjects" | grep -qE '^feat(\(.+\))?:'; then
+            level=minor
+          elif printf '%s\n' "$subjects" | grep -qE '^(fix|perf)(\(.+\))?:'; then
+            level=patch
+          else
+            echo "No releasable commits since ${last:-start}; skipping."
+            echo "release=false" >>"$GITHUB_OUTPUT"; exit 0
+          fi
+          IFS=. read -r MA MI PA <<<"$base"
+          case "$level" in
+            major) MA=$((MA + 1)); MI=0; PA=0 ;;
+            minor) MI=$((MI + 1)); PA=0 ;;
+            patch) PA=$((PA + 1)) ;;
+          esac
+          echo "release=true" >>"$GITHUB_OUTPUT"
+          echo "version=$MA.$MI.$PA" >>"$GITHUB_OUTPUT"
+          echo "Releasing v$MA.$MI.$PA ($level, from ${last:-none})"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.ver.outputs.release == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.ver.outputs.release == 'true'
+
+      - name: Stamp version into the build
+        if: steps.ver.outputs.release == 'true'
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          sed -i '' -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/" Cargo.toml
+          /usr/bin/plutil -replace CFBundleShortVersionString -string "$V" packaging/Info.plist
+          /usr/bin/plutil -replace CFBundleVersion -string "$V" packaging/Info.plist
+
+      - name: Build bundle
+        if: steps.ver.outputs.release == 'true'
+        run: ./scripts/bundle.sh
+
+      - name: Tag and publish release
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$V" -m "v$V"
+          git push origin "v$V"
+          gh release create "v$V" dist/Spotlight-rs.zip --title "v$V" --generate-notes
+
+      - name: Checkout Homebrew tap
+        if: steps.ver.outputs.release == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Nickhoyer/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Bump cask in tap
+        if: steps.ver.outputs.release == 'true'
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          SHA="$(shasum -a 256 dist/Spotlight-rs.zip | awk '{print $1}')"
+          CASK=tap/Casks/spotlight-rs.rb
+          sed -i '' -E "s/^  version \".*\"/  version \"$V\"/" "$CASK"
+          sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" "$CASK"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git diff --quiet || git commit -aqm "spotlight-rs $V"
+          git push
