@@ -160,7 +160,7 @@ pub fn presets() -> Vec<Provider> {
 pub fn panel_entry() -> PanelEntry {
     PanelEntry {
         id: EXT_ID.to_string(),
-        title: "AI Chat".to_string(),
+        title: "Ask AI".to_string(),
         glyph: "\u{2728}".to_string(), // ✨ fallback if the logo can't be rasterized
         icon: None, // the shell renders the built-in "llm" logo (logo_tile)
         make_view: Box::new(|cx, seed| {
