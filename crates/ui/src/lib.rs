@@ -259,9 +259,11 @@ impl SpotlightView {
         };
         view.reset_home_sel();
 
-        // Hide the launcher when it loses focus — clicking outside, opening a
-        // Jira link, or launching an app all deactivate our window. Skipped under
-        // capture so screenshots aren't dismissed.
+        // Hide the launcher when it loses focus — this is the click-outside
+        // dismissal path (clicking another window/app deactivates us). Result
+        // activation hides explicitly (see `activate_search`), so this also acts
+        // as a harmless backstop there. Skipped under capture so screenshots
+        // aren't dismissed.
         if std::env::var_os("SPOTLIGHT_CAPTURE").is_none() {
             cx.observe_window_activation(window, |view, window, cx| {
                 if !view.activation_primed {
@@ -501,11 +503,11 @@ impl SpotlightView {
         // `tick_highlight`, at the same speed as the highlight pill.
     }
 
-    fn home_activate(&mut self, cx: &mut Context<Self>) {
+    fn home_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.home_sel {
             HomeSel::Recents(i) => {
                 if let Some(recent) = self.config.recents().get(i).cloned() {
-                    self.reopen_and_record(recent, cx);
+                    self.reopen_and_record(recent, window, cx);
                 }
             }
             HomeSel::Shortcuts(i) => {
@@ -527,15 +529,17 @@ impl SpotlightView {
             Action::Open(path) => {
                 let _ = spotlight_platform_macos::apps::launch(path);
                 self.record_activation(&item);
+                self.hide(window, cx);
+                return;
             }
             Action::OpenUrl(url) => {
                 open_url(url);
                 self.record_activation(&item);
+                self.hide(window, cx);
+                return;
             }
             Action::Copy(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                // Copying leaves us focused (nothing else came forward), so
-                // dismiss explicitly the way opening an app/url does implicitly.
                 self.hide(window, cx);
                 return;
             }
@@ -549,6 +553,8 @@ impl SpotlightView {
                 if let Some(ext) = self.registry.owner(&item.source) {
                     let _ = ext.run(id);
                 }
+                self.hide(window, cx);
+                return;
             }
             Action::None => {}
         }
@@ -587,7 +593,7 @@ impl SpotlightView {
 
     /// Re-open a recent: navigate into an extension panel, or open a URL/path.
     /// (`go_panel` records its own use, so panels don't also persist here.)
-    fn reopen_and_record(&mut self, recent: Recent, cx: &mut Context<Self>) {
+    fn reopen_and_record(&mut self, recent: Recent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = &recent.panel {
             let id = panel.clone();
             self.go_panel(&id, cx);
@@ -595,7 +601,9 @@ impl SpotlightView {
         }
         reopen_recent(&recent);
         self.persist_use(recent);
-        cx.notify();
+        // Opening a URL/path hands off to another app; dismiss explicitly rather
+        // than relying on window deactivation (see `activate_search`).
+        self.hide(window, cx);
     }
 
     /// Append to the usage history. Loads/saves config fresh so it doesn't
@@ -741,7 +749,7 @@ impl SpotlightView {
                     return;
                 }
                 "enter" => {
-                    self.home_activate(cx);
+                    self.home_activate(window, cx);
                     return;
                 }
                 "backspace" => return,
@@ -907,8 +915,8 @@ impl SpotlightView {
                         .id(("home-recent", i))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.reopen_and_record(entry.clone(), cx)
+                            cx.listener(move |this, _, window, cx| {
+                                this.reopen_and_record(entry.clone(), window, cx)
                             }),
                         ),
                 );
