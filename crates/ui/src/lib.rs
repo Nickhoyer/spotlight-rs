@@ -77,8 +77,10 @@ pub struct PanelEntry {
     /// Optional path to an image file used as the shortcut icon instead of `glyph`.
     pub icon: Option<String>,
     /// Builds a fresh view each time the panel is opened. Reads current config
-    /// itself, so settings edits take effect on the next open.
-    pub make_view: Box<dyn Fn(&mut App) -> AnyView>,
+    /// itself, so settings edits take effect on the next open. Receives the
+    /// search text the panel was opened from (`None` when opened from Home /
+    /// recents), so panels like the LLM chat can seed themselves with it.
+    pub make_view: Box<dyn Fn(&mut App, Option<&str>) -> AnyView>,
 }
 
 /// A settings tab contributed by an extension.
@@ -298,7 +300,7 @@ impl SpotlightView {
                 "settings" => view.go_settings(cx),
                 id if !id.is_empty() => {
                     let id = id.to_string();
-                    view.go_panel(&id, cx);
+                    view.go_panel(&id, None, cx);
                 }
                 _ => {}
             }
@@ -346,7 +348,9 @@ impl SpotlightView {
         cx.notify();
     }
 
-    fn go_panel(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// `seed` is the search text the panel was opened from (`None` from Home /
+    /// recents), passed through to the panel's `make_view` so it can pre-fill.
+    fn go_panel(&mut self, id: &str, seed: Option<String>, cx: &mut Context<Self>) {
         let Some(entry) = self.ui.panels.iter().find(|p| p.id == id) else {
             return;
         };
@@ -355,7 +359,7 @@ impl SpotlightView {
         let glyph = entry.glyph.clone();
         let icon = entry.icon.clone();
         let from = self.screen.clone();
-        let view = (entry.make_view)(cx);
+        let view = (entry.make_view)(cx, seed.as_deref());
         self.panel = Some(view);
         self.screen = Screen::Extension(id.to_string());
         self.selected = 0;
@@ -513,7 +517,7 @@ impl SpotlightView {
             HomeSel::Shortcuts(i) => {
                 if i < self.ui.panels.len() {
                     let id = self.ui.panels[i].id.clone();
-                    self.go_panel(&id, cx);
+                    self.go_panel(&id, None, cx);
                 } else {
                     self.go_settings(cx);
                 }
@@ -544,9 +548,12 @@ impl SpotlightView {
                 return;
             }
             Action::OpenPanel(id) => {
-                // Navigate into the panel (which records its own recents entry).
+                // Navigate into the panel (which records its own recents entry),
+                // seeding it with the current search text so chat-style panels
+                // can pre-fill and auto-send.
                 let id = id.clone();
-                self.go_panel(&id, cx);
+                let seed = self.query.clone();
+                self.go_panel(&id, Some(seed), cx);
                 return;
             }
             Action::Custom(id) => {
@@ -596,7 +603,7 @@ impl SpotlightView {
     fn reopen_and_record(&mut self, recent: Recent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = &recent.panel {
             let id = panel.clone();
-            self.go_panel(&id, cx);
+            self.go_panel(&id, None, cx);
             return;
         }
         reopen_recent(&recent);
@@ -957,7 +964,7 @@ impl SpotlightView {
             strip = strip.child(
                 home_card(leading, &p.title).id(("home-shortcut", i)).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.go_panel(&id, cx)),
+                    cx.listener(move |this, _, _, cx| this.go_panel(&id, None, cx)),
                 ),
             );
         }
@@ -1810,6 +1817,8 @@ fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool
                 img(ImageSource::Render(image))
                     .w(px(28.))
                     .h(px(28.))
+                    // Same corner-radius proportion as the Home tiles (9/40).
+                    .rounded(px(28. * ICON_RADIUS / ICON_SIZE))
                     .object_fit(ObjectFit::Cover),
             )
     } else if let Some(render_image) = icon {
@@ -1825,6 +1834,7 @@ fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool
                 img(ImageSource::Render(render_image))
                     .w(px(28.))
                     .h(px(28.))
+                    .rounded(px(28. * ICON_RADIUS / ICON_SIZE))
                     .object_fit(ObjectFit::Contain),
             )
     } else {

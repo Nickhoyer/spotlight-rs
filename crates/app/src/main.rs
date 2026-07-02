@@ -34,12 +34,23 @@ fn main() {
     registry.register(Arc::new(ext_jira::JiraSearch));
     // Clipboard history is searchable from the main bar (keyword: `clip`).
     registry.register(clipboard.extension());
+    // A dynamic "Ask AI" entry that always appears (ranked very low) and opens
+    // the chat panel seeded with the typed text.
+    registry.register(Arc::new(ext_llm::LlmSearch));
 
     // GPUI-aware extensions (panels + settings tabs + menu-bar items) are wired
     // here.
     let ui = UiExtensions {
-        panels: vec![ext_jira::panel_entry(), clipboard.panel_entry()],
-        settings_tabs: vec![ext_jira::settings_tab(), clipboard.settings_tab()],
+        panels: vec![
+            ext_jira::panel_entry(),
+            clipboard.panel_entry(),
+            ext_llm::panel_entry(),
+        ],
+        settings_tabs: vec![
+            ext_jira::settings_tab(),
+            clipboard.settings_tab(),
+            ext_llm::settings_tab(),
+        ],
         menu_items: clipboard.menu_items(),
     };
 

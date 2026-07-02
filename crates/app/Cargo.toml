@@ -15,3 +15,4 @@ ext-apps.workspace = true
 ext-calculator.workspace = true
 ext-clipboard.workspace = true
 ext-jira.workspace = true
+ext-llm.workspace = true

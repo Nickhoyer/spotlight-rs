@@ -66,8 +66,8 @@ fn render_svg(svg: &str, size: u32) -> Option<tiny_skia::Pixmap> {
     Some(pixmap)
 }
 
-/// Return the cached rasterized logo for `kind` (`"clipboard"` or `"settings"`),
-/// or `None` for an unknown kind / rasterization failure.
+/// Return the cached rasterized logo for `kind` (`"clipboard"`, `"settings"`, or
+/// `"llm"` for AI Chat), or `None` for an unknown kind / rasterization failure.
 pub fn logo(kind: &str) -> Option<Arc<RenderImage>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<RenderImage>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -77,8 +77,9 @@ pub fn logo(kind: &str) -> Option<Arc<RenderImage>> {
         }
     }
     let svg = match kind {
-        "clipboard" => CLIPBOARD_SVG.to_string(),
+        "clipboard" => clipboard_svg(),
         "settings" => settings_svg(),
+        "llm" => ai_svg(),
         _ => return None,
     };
     let image = rasterize(&svg, RASTER_PX).map(Arc::new);
@@ -115,49 +116,69 @@ fn rasterize(svg: &str, size: u32) -> Option<RenderImage> {
     Some(RenderImage::new(vec![image::Frame::new(buffer)]))
 }
 
-/// Deep teal→indigo tile with a white clipboard and slate ruled lines.
-const CLIPBOARD_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">
-  <defs>
-    <linearGradient id="c" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#0b7285"/>
-      <stop offset="1" stop-color="#16307a"/>
-    </linearGradient>
-  </defs>
-  <rect width="40" height="40" rx="9" fill="url(#c)"/>
-  <rect x="9.5" y="9" width="21" height="24.5" rx="3.6" fill="#eef3f8"/>
-  <rect x="14.8" y="5.4" width="10.4" height="6.4" rx="2.6" fill="#eef3f8"/>
-  <rect x="16.6" y="7" width="6.8" height="3.1" rx="1.55" fill="url(#c)"/>
-  <g fill="#9fb0c9">
-    <rect x="13.6" y="16.4" width="12.8" height="2.3" rx="1.15"/>
-    <rect x="13.6" y="21.1" width="12.8" height="2.3" rx="1.15"/>
-    <rect x="13.6" y="25.8" width="8.4" height="2.3" rx="1.15"/>
-  </g>
-</svg>"##;
+// ── ICON GUIDELINES ─────────────────────────────────────────────────────────
+// The built-in panel logos (Settings, Clipboard, AI Chat) form one cohesive set.
+// Keep new ones consistent while leaving room for per-icon character:
+//
+//  • Canvas: a 40×40 viewBox with the shared rounded tile (`rect rx=9`,
+//    `url(#bg)` gunmetal gradient). Never a bare/transparent symbol — always the
+//    tile, so search results and Home tiles round identically.
+//  • Symbol: the app's cyan accent (`url(#sym)`), drawn twice — a blurred glow
+//    copy underneath (`fill="#28c8f0" filter="url(#glow)"`, ~0.5–0.65 opacity)
+//    then the crisp gradient on top. This is the "glowing HUD" look.
+//  • Center the symbol with even margins (roughly the 6–34 band on both axes).
+//  • Creative license: one extra accent per icon is welcome for identity — a
+//    bright-white highlight (AI's sparkle), engraved dark detail on a filled
+//    shape (Clipboard's ruled lines), etc. Keep the tile + cyan glow constant.
+//
+// Compose via `logo_svg(body)`; `body` is the symbol markup (glow + crisp).
 
-/// Gunmetal tile with a neon-cyan gear (a crisp solid cog over a soft glow), for a
-/// futuristic HUD look that matches the app's cyan accent.
+/// Shared palette + filters: gunmetal tile background, cyan symbol gradient, and
+/// the soft glow. See ICON GUIDELINES above.
+const LOGO_DEFS: &str = r##"
+  <linearGradient id="bg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#2b3444"/><stop offset="1" stop-color="#111621"/>
+  </linearGradient>
+  <linearGradient id="sym" x1="0" y1="4" x2="0" y2="36" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#a7f2ff"/><stop offset="1" stop-color="#37c6ec"/>
+  </linearGradient>
+  <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+    <feGaussianBlur stdDeviation="1.5"/>
+  </filter>
+"##;
+
+/// Wrap symbol `body` in the shared tile (rounded gunmetal square) + defs.
+fn logo_svg(body: &str) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><defs>{defs}</defs><rect width="40" height="40" rx="9" fill="url(#bg)"/>{body}</svg>"##,
+        defs = LOGO_DEFS,
+        body = body,
+    )
+}
+
+/// Gunmetal tile with a glowing cyan gear (crisp cog over a soft glow) — the
+/// reference for the set's futuristic HUD look.
 fn settings_svg() -> String {
     let gear = gear_path();
-    format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#2b3444"/>
-      <stop offset="1" stop-color="#111621"/>
-    </linearGradient>
-    <linearGradient id="cog" x1="0" y1="4" x2="0" y2="36" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#a7f2ff"/>
-      <stop offset="1" stop-color="#37c6ec"/>
-    </linearGradient>
-    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="1.7"/>
-    </filter>
-  </defs>
-  <rect width="40" height="40" rx="9" fill="url(#bg)"/>
-  <path d="{gear}" fill="#28c8f0" fill-rule="evenodd" filter="url(#glow)" opacity="0.65"/>
-  <path d="{gear}" fill="url(#cog)" fill-rule="evenodd"/>
-</svg>"##
-    )
+    logo_svg(&format!(
+        r##"<path d="{gear}" fill="#28c8f0" fill-rule="evenodd" filter="url(#glow)" opacity="0.65"/><path d="{gear}" fill="url(#sym)" fill-rule="evenodd"/>"##
+    ))
+}
+
+/// Glowing cyan clipboard with dark engraved ruled lines.
+fn clipboard_svg() -> String {
+    let board = r##"<rect x="10" y="9" width="20" height="24" rx="3.4"/><rect x="15" y="5.6" width="10" height="6" rx="2.6"/>"##;
+    logo_svg(&format!(
+        r##"<g fill="#28c8f0" filter="url(#glow)" opacity="0.5">{board}</g><g fill="url(#sym)">{board}</g><g fill="#182231"><rect x="14" y="16.4" width="12" height="2.1" rx="1.05"/><rect x="14" y="20.6" width="12" height="2.1" rx="1.05"/><rect x="14" y="24.8" width="8" height="2.1" rx="1.05"/></g>"##
+    ))
+}
+
+/// Glowing cyan speech bubble with a bright white AI sparkle.
+fn ai_svg() -> String {
+    let bubble = r##"<path d="M12 9H28a5 5 0 0 1 5 5v9a5 5 0 0 1-5 5H19l-6 5v-5a5 5 0 0 1-5-5V14a5 5 0 0 1 5-5Z"/>"##;
+    logo_svg(&format!(
+        r##"<g fill="#28c8f0" filter="url(#glow)" opacity="0.6">{bubble}</g><g fill="url(#sym)">{bubble}</g><path d="M20.2 12.4c.8 3.9 2.1 5.2 6 6-3.9.8-5.2 2.1-6 6-.8-3.9-2.1-5.2-6-6 3.9-.8 5.2-2.1 6-6Z" fill="#f2feff"/><path d="M28.5 12c.4 1.9 1 2.5 2.9 2.9-1.9.4-2.5 1-2.9 2.9-.4-1.9-1-2.5-2.9-2.9 1.9-.4 2.5-1 2.9-2.9Z" fill="#eafcff" opacity="0.9"/>"##
+    ))
 }
 
 /// A solid cog silhouette (eight trapezoidal teeth) with a round hub cut out via

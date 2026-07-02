@@ -10,6 +10,7 @@ members = [
     "extensions/calculator",
     "extensions/clipboard",
     "extensions/jira",
+    "extensions/llm",
 ]
 
 [workspace.package]
@@ -54,6 +55,7 @@ ext-apps = { path = "extensions/apps" }
 ext-calculator = { path = "extensions/calculator" }
 ext-clipboard = { path = "extensions/clipboard" }
 ext-jira = { path = "extensions/jira" }
+ext-llm = { path = "extensions/llm" }
 
 [profile.dev]
 # GPUI is heavy; a little optimization on deps keeps dev runs smooth without
