@@ -10,6 +10,7 @@
 //! shape (OpenAI, Groq, OpenRouter, Ollama, LM Studio, …) and the Anthropic
 //! Messages API. Both stream token-by-token over Server-Sent Events.
 
+mod autocomplete;
 mod client;
 mod markdown;
 mod search;
@@ -65,13 +66,27 @@ pub struct Provider {
 }
 
 /// Persisted AI settings (provider API keys live in the secret store).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     #[serde(default)]
     pub providers: Vec<Provider>,
     /// Index into `providers` of the provider used for new chats.
     #[serde(default)]
     pub active: usize,
+    /// Whether the search bar offers inline autocomplete (DuckDuckGo-backed) +
+    /// "Ask AI" suggestion rows. On by default.
+    #[serde(default = "default_true")]
+    pub autocomplete: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self { providers: Vec::new(), active: 0, autocomplete: true }
+    }
 }
 
 impl LlmConfig {
@@ -170,6 +185,11 @@ pub fn panel_entry() -> PanelEntry {
     }
 }
 
+/// The inline AI autocomplete source (ghost text + "Ask AI" suggestion rows).
+pub fn autocomplete_provider() -> spotlight_ui::AutocompleteProvider {
+    autocomplete::provider()
+}
+
 /// The "AI" tab in Settings.
 pub fn settings_tab() -> SettingsTabFactory {
     SettingsTabFactory {
@@ -194,6 +214,7 @@ mod tests {
         let cfg = LlmConfig {
             providers: vec![Provider { name: "A".into(), ..Default::default() }],
             active: 5, // out of range
+            ..Default::default()
         };
         assert_eq!(cfg.active_provider().map(|p| p.name.as_str()), Some("A"));
     }

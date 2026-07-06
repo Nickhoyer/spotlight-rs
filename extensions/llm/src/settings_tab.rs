@@ -35,8 +35,11 @@ struct ProviderRow {
 pub struct LlmSettingsTab {
     rows: Vec<ProviderRow>,
     active: usize,
+    /// Whether the search bar offers inline autocomplete + "Ask AI" suggestions.
+    autocomplete: bool,
     preset_focuses: Vec<FocusHandle>,
     find_focus: FocusHandle,
+    autocomplete_focus: FocusHandle,
     save_focus: FocusHandle,
     status: Option<String>,
 }
@@ -61,11 +64,18 @@ impl LlmSettingsTab {
         Self {
             rows,
             active: cfg.active,
+            autocomplete: cfg.autocomplete,
             preset_focuses,
             find_focus: cx.focus_handle(),
+            autocomplete_focus: cx.focus_handle(),
             save_focus: cx.focus_handle(),
             status: None,
         }
+    }
+
+    fn toggle_autocomplete(&mut self, cx: &mut Context<Self>) {
+        self.autocomplete = !self.autocomplete;
+        cx.notify();
     }
 
     fn row_from(p: &Provider, key: Option<String>, cx: &mut Context<Self>) -> ProviderRow {
@@ -186,7 +196,10 @@ impl LlmSettingsTab {
         let active = self.active.min(providers.len().saturating_sub(1));
 
         let mut cfg = AppConfig::load();
-        let _ = cfg.set(crate::EXT_ID, &LlmConfig { providers, active });
+        let _ = cfg.set(
+            crate::EXT_ID,
+            &LlmConfig { providers, active, autocomplete: self.autocomplete },
+        );
         self.status = Some(match cfg.save() {
             Ok(()) => "Saved. Reopen AI Chat to use the new settings.".to_string(),
             Err(e) => format!("Couldn't save: {e}"),
@@ -312,6 +325,32 @@ impl Render for LlmSettingsTab {
             .child(div().h(px(1.)).bg(theme::divider()))
             .child(div().pt_2().text_xs().text_color(theme::muted()).child("Providers"))
             .child(cards)
+            .child(div().h(px(1.)).bg(theme::divider()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pt_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_sm().text_color(theme::text()).child("Inline autocomplete"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child("Greyed-out search suggestions (Tab to accept) + \u{201c}Ask AI\u{201d} rows. Uses DuckDuckGo."),
+                            ),
+                    )
+                    .child(controls::button(
+                        &self.autocomplete_focus,
+                        if self.autocomplete { "\u{2713} On" } else { "Off" },
+                        cx,
+                        |this, _, cx| this.toggle_autocomplete(cx),
+                    )),
+            )
             .child(
                 div()
                     .flex()

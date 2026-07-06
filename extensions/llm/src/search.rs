@@ -42,7 +42,7 @@ impl Extension for LlmSearch {
             // Icon comes from the built-in "llm" logo: `result_row` renders the
             // panel logo for `Action::OpenPanel`, matching the Home tile.
             icon: None,
-            action: Action::OpenPanel(crate::EXT_ID.to_string()),
+            action: Action::OpenPanel { id: crate::EXT_ID.to_string(), seed: None },
             score: SCORE,
             source: crate::EXT_ID.to_string(),
         }]

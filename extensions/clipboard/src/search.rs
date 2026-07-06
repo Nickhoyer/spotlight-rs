@@ -30,7 +30,7 @@ impl Extension for ClipboardSearch {
             title: "Clipboard History".to_string(),
             subtitle: Some("Browse and paste copied items".to_string()),
             icon: Some(Icon::Glyph(crate::GLYPH.to_string())),
-            action: Action::OpenPanel(crate::EXT_ID.to_string()),
+            action: Action::OpenPanel { id: crate::EXT_ID.to_string(), seed: None },
             score: score as i32,
             source: crate::EXT_ID.to_string(),
         }]

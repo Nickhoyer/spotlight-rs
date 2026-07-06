@@ -40,6 +40,11 @@ use crate::settings::GeneralSettingsView;
 const MAX_RESULTS: usize = 50;
 /// How many recents to show on Home.
 const MAX_RECENTS: usize = 5;
+/// Don't ask the AI to autocomplete until the query is at least this long.
+const MIN_AC_LEN: usize = 2;
+/// Debounce before firing an autocomplete request, so mid-word keystrokes don't
+/// each spawn a call.
+const AC_DEBOUNCE_MS: u64 = 250;
 
 /// CoreGraphics window number of the launcher window, published once the window
 /// exists so the debug capture thread (see [`run`]) can grab it. Zero until set.
@@ -97,6 +102,36 @@ pub struct MenuItem {
     pub action: Box<dyn Fn(&mut App)>,
 }
 
+/// Request handed to an [`AutocompleteProvider`]. Runs on a background thread, so
+/// everything here is owned.
+pub struct AutocompleteRequest {
+    /// The current search text.
+    pub query: String,
+    /// A strong local match (top result title) offered to the model as a
+    /// candidate completion, when the local result was high-scoring.
+    pub top_hint: Option<String>,
+}
+
+/// Ghost text plus ready-made "Ask AI" suggestion rows returned by an
+/// [`AutocompleteProvider`].
+pub struct Suggestions {
+    /// Inline continuation of the query (only the text that *follows* it); empty
+    /// when there's nothing to suggest.
+    pub ghost: String,
+    /// Complete result rows to splice into the list (already carrying their own
+    /// [`Action::OpenPanel`] seed).
+    pub entries: Vec<ResultItem>,
+}
+
+/// An AI autocomplete source contributed by an extension. `suggest` is called off
+/// the UI thread (blocking network is fine) and returns `None` when disabled or
+/// unconfigured. Wrapped in an `Arc` so the shell can clone it into a background
+/// task.
+#[derive(Clone)]
+pub struct AutocompleteProvider {
+    pub suggest: Arc<dyn Fn(AutocompleteRequest) -> Option<Suggestions> + Send + Sync>,
+}
+
 /// GPUI-aware extension registrations, passed to [`run`] alongside the
 /// (GPUI-free) [`Registry`].
 #[derive(Default)]
@@ -106,6 +141,8 @@ pub struct UiExtensions {
     /// Extra entries added to the menu-bar menu (between the built-in
     /// Open/Settings and Launch-at-Login/Quit items).
     pub menu_items: Vec<MenuItem>,
+    /// Optional inline AI autocomplete + "Ask AI" suggestion source.
+    pub autocomplete: Option<AutocompleteProvider>,
 }
 
 /// Which screen the launcher is currently showing.
@@ -139,6 +176,21 @@ pub struct SpotlightView {
     query: String,
     results: Vec<ResultItem>,
     selected: usize,
+    /// Greyed-out inline autocomplete: the continuation shown after the caret and
+    /// accepted with Tab. Seeded instantly from a strong local match, then
+    /// replaced by the LLM's completion when it arrives.
+    ghost: String,
+    /// AI-suggested "Ask AI" rows for `ai_query`, spliced into `results`.
+    ai_suggestions: Vec<ResultItem>,
+    /// The query `ghost`/`ai_suggestions` were computed for; guards against
+    /// splicing stale suggestions after the query has moved on.
+    ai_query: String,
+    /// Bumped on every query change so a late autocomplete response for an older
+    /// query can be dropped.
+    ac_gen: u64,
+    /// The in-flight debounced autocomplete task (dropped/cancelled on the next
+    /// keystroke by being replaced).
+    ac_task: Option<gpui::Task<()>>,
     focus_handle: FocusHandle,
     /// Rasterized app icons keyed by path, so each icon is rasterized once and
     /// reused across frames (gpui's `RenderImage` is cached by `Arc` identity).
@@ -228,6 +280,11 @@ impl SpotlightView {
             query: String::new(),
             results: Vec::new(),
             selected: 0,
+            ghost: String::new(),
+            ai_suggestions: Vec::new(),
+            ai_query: String::new(),
+            ac_gen: 0,
+            ac_task: None,
             focus_handle,
             icon_cache: HashMap::new(),
             panel: None,
@@ -290,9 +347,9 @@ impl SpotlightView {
         if let Ok(q) = std::env::var("SPOTLIGHT_CAPTURE_QUERY") {
             if !q.is_empty() {
                 view.query = q;
-                let query = view.query.clone();
-                view.results = view.ranked_results(&query);
-                view.screen = Screen::Search;
+                // Go through the real query path so captures exercise the ghost
+                // autocomplete and any AI suggestion rows.
+                view.refresh_query(cx);
             }
         }
         if let Ok(screen) = std::env::var("SPOTLIGHT_CAPTURE_SCREEN") {
@@ -447,9 +504,55 @@ impl SpotlightView {
         results
     }
 
+    /// Splice the AI "Ask AI" suggestion rows (when current for this query) into a
+    /// ranked list, grouped just above the generic Ask AI entry (same source).
+    fn splice_suggestions(&self, mut ranked: Vec<ResultItem>) -> Vec<ResultItem> {
+        if self.ai_query == self.query {
+            if let Some(first) = self.ai_suggestions.first() {
+                let src = first.source.clone();
+                let pos = ranked.iter().position(|r| r.source == src).unwrap_or(ranked.len());
+                for (i, item) in self.ai_suggestions.iter().enumerate() {
+                    ranked.insert(pos + i, item.clone());
+                }
+            }
+        }
+        ranked
+    }
+
+    /// Recompute `results` from the registry and re-splice AI suggestions. Called
+    /// when an autocomplete response arrives (the query itself is unchanged).
+    fn rebuild_results(&mut self) {
+        let ranked = self.ranked_results(&self.query);
+        self.results = self.splice_suggestions(ranked);
+    }
+
     fn refresh_query(&mut self, cx: &mut Context<Self>) {
         let query = self.query.clone();
-        self.results = self.ranked_results(&query);
+        // A new query supersedes any pending autocomplete and its (now stale)
+        // ghost. Keep prior suggestions only if they were computed for this exact
+        // query (e.g. re-entering after Escape); otherwise drop them.
+        self.ac_gen = self.ac_gen.wrapping_add(1);
+        self.ghost.clear();
+        if self.ai_query != query {
+            self.ai_suggestions.clear();
+        }
+
+        // Rank once, then reuse the ranking to seed an instant heuristic ghost and
+        // a candidate hint for the model.
+        let ranked = self.ranked_results(&query);
+        let hint = ranked.iter().find(|r| r.score > 0).map(|r| r.title.clone());
+        if !query.is_empty() {
+            if let Some(h) = &hint {
+                let (ql, hl) = (query.to_lowercase(), h.to_lowercase());
+                if hl.starts_with(&ql) && h.chars().count() > query.chars().count() {
+                    // Continuation by char count, so a case-insensitive match never
+                    // slices a title mid-codepoint.
+                    self.ghost = h.chars().skip(query.chars().count()).collect();
+                }
+            }
+        }
+        self.results = self.splice_suggestions(ranked);
+
         self.selected = 0;
         self.screen = if self.query.trim().is_empty() {
             self.reset_home_sel();
@@ -457,7 +560,51 @@ impl SpotlightView {
         } else {
             Screen::Search
         };
+
+        // Debounced AI autocomplete (replaces/refines the heuristic ghost and adds
+        // suggestion rows). Dropping the previous task cancels its pending timer.
+        self.ac_task = if self.ui.autocomplete.is_some() && query.chars().count() >= MIN_AC_LEN {
+            Some(self.schedule_autocomplete(query, hint, cx))
+        } else {
+            None
+        };
         cx.notify();
+    }
+
+    /// Fire a debounced autocomplete request on the background executor and, when
+    /// it returns for the still-current query, apply its ghost + suggestion rows.
+    fn schedule_autocomplete(
+        &self,
+        query: String,
+        hint: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        let gen = self.ac_gen;
+        let suggest = self.ui.autocomplete.as_ref().unwrap().suggest.clone();
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(Duration::from_millis(AC_DEBOUNCE_MS)).await;
+            // Superseded by a newer keystroke while we waited out the debounce.
+            if weak.update(cx, |t, _| t.ac_gen != gen).unwrap_or(true) {
+                return;
+            }
+            let req = AutocompleteRequest { query: query.clone(), top_hint: hint };
+            let out = cx.background_executor().spawn(async move { (suggest)(req) }).await;
+            let Some(s) = out else { return };
+            let _ = weak.update(cx, |t, cx| {
+                if t.ac_gen != gen || t.query != query {
+                    return;
+                }
+                // The LLM completion replaces the instant heuristic; if it came
+                // back empty, the heuristic ghost stays.
+                if !s.ghost.is_empty() {
+                    t.ghost = s.ghost;
+                }
+                t.ai_suggestions = s.entries;
+                t.ai_query = query.clone();
+                t.rebuild_results();
+                cx.notify();
+            });
+        })
     }
 
     /// Length of the currently navigable Search results list.
@@ -547,12 +694,13 @@ impl SpotlightView {
                 self.hide(window, cx);
                 return;
             }
-            Action::OpenPanel(id) => {
+            Action::OpenPanel { id, seed } => {
                 // Navigate into the panel (which records its own recents entry),
-                // seeding it with the current search text so chat-style panels
-                // can pre-fill and auto-send.
+                // seeding it with the item's own text when set (AI suggestion
+                // entries), else the current search text so chat-style panels can
+                // pre-fill and auto-send.
                 let id = id.clone();
-                let seed = self.query.clone();
+                let seed = seed.clone().unwrap_or_else(|| self.query.clone());
                 self.go_panel(&id, Some(seed), cx);
                 return;
             }
@@ -789,6 +937,16 @@ impl SpotlightView {
                     cx.notify();
                 }
             }
+            // Tab (and Right at the end of the line) accept the greyed-out inline
+            // autocomplete, appending it to the query. Tab is swallowed either way
+            // so it never inserts a tab character.
+            "tab" | "right" => {
+                if !self.ghost.is_empty() {
+                    let ghost = std::mem::take(&mut self.ghost);
+                    self.query.push_str(&ghost);
+                    self.refresh_query(cx);
+                }
+            }
             "enter" => self.activate_search(window, cx),
             _ => {
                 if !modifiers.platform && !modifiers.control {
@@ -835,6 +993,12 @@ impl SpotlightView {
                     .items_center()
                     .child(div().text_xl().text_color(theme::text()).child(self.query.clone()))
                     .child(caret)
+                    // Greyed-out inline autocomplete after the caret (Tab accepts).
+                    .when(!self.ghost.is_empty(), |row| {
+                        row.child(
+                            div().text_xl().text_color(theme::muted()).child(self.ghost.clone()),
+                        )
+                    })
                     .when(self.query.is_empty(), |row| {
                         row.child(
                             div()
@@ -1804,7 +1968,7 @@ fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool
     // A result that opens a built-in panel (e.g. Clipboard History) uses that
     // panel's generated logo, so search matches the Home tiles.
     let panel_logo = match &item.action {
-        Action::OpenPanel(id) => logo::logo(id),
+        Action::OpenPanel { id, .. } => logo::logo(id),
         _ => None,
     };
     let leading = if let Some(image) = panel_logo {

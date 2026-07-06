@@ -52,6 +52,8 @@ fn main() {
             ext_llm::settings_tab(),
         ],
         menu_items: clipboard.menu_items(),
+        // Inline AI autocomplete (ghost text) + "Ask AI" suggestion rows.
+        autocomplete: Some(ext_llm::autocomplete_provider()),
     };
 
     spotlight_ui::run(registry, ui);
