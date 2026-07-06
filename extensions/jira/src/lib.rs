@@ -104,10 +104,12 @@ fn cache_path(filter_name: &str) -> PathBuf {
 
 /// Load cached issues for a filter (empty on miss/corruption).
 pub fn load_cache(filter_name: &str) -> Vec<Issue> {
-    std::fs::read_to_string(cache_path(filter_name))
+    let mut issues: Vec<Issue> = std::fs::read_to_string(cache_path(filter_name))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    models::sort_by_status(&mut issues);
+    issues
 }
 
 /// Persist the latest issues for a filter so the next open renders instantly.

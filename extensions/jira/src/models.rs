@@ -150,6 +150,31 @@ impl Issue {
     }
 }
 
+/// Custom status ordering for the issue list. These statuses sort first, in this
+/// exact order (matched case-insensitively, since boards aren't consistent about
+/// casing); every other status follows, alphabetically by name.
+const STATUS_ORDER: [&str; 4] = ["in progress", "fix required", "ready to live", "todo"];
+
+/// Rank a status by [`STATUS_ORDER`]; unlisted statuses share the trailing rank
+/// and are then broken alphabetically by the caller.
+fn status_rank(status: &str) -> usize {
+    let lower = status.to_lowercase();
+    STATUS_ORDER
+        .iter()
+        .position(|s| *s == lower)
+        .unwrap_or(STATUS_ORDER.len())
+}
+
+/// Sort issues by the custom status order, then alphabetically by status name.
+/// Stable, so issues sharing a status keep their incoming (API/cache) order.
+pub fn sort_by_status(issues: &mut [Issue]) {
+    issues.sort_by(|a, b| {
+        status_rank(&a.status)
+            .cmp(&status_rank(&b.status))
+            .then_with(|| a.status.to_lowercase().cmp(&b.status.to_lowercase()))
+    });
+}
+
 /// A colored emoji indicating priority. Empty/unknown priorities get a neutral dot.
 pub fn priority_icon(name: &str) -> &'static str {
     match name.to_ascii_lowercase().as_str() {
@@ -219,6 +244,41 @@ mod tests {
         assert_eq!(priority_icon("unknown"), "·");
         assert_eq!(initials("Jane Doe"), "JD");
         assert_eq!(initials("Cher"), "C");
+    }
+
+    #[test]
+    fn sorts_by_custom_status_order_then_alpha() {
+        let mk = |status: &str| Issue {
+            key: status.into(),
+            summary: String::new(),
+            status: status.into(),
+            status_color: StatusColor::Other,
+            priority: String::new(),
+            assignee: None,
+            assignee_id: None,
+        };
+        // Includes mixed casing and statuses outside the custom order.
+        let mut issues = vec![
+            mk("Done"),
+            mk("Todo"),
+            mk("Ready to live"),
+            mk("Backlog"),
+            mk("FIX REQUIRED"),
+            mk("in progress"),
+        ];
+        sort_by_status(&mut issues);
+        let order: Vec<&str> = issues.iter().map(|i| i.status.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "in progress",
+                "FIX REQUIRED",
+                "Ready to live",
+                "Todo",
+                "Backlog", // then alphabetical: Backlog before Done
+                "Done",
+            ]
+        );
     }
 
     #[test]

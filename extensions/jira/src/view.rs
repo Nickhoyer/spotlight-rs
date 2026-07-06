@@ -151,7 +151,8 @@ impl JiraView {
                 }
                 this.fetching = false;
                 match result {
-                    Ok(issues) => {
+                    Ok(mut issues) => {
+                        models::sort_by_status(&mut issues);
                         crate::save_cache(&name, &issues);
                         let len = issues.len();
                         this.issues = issues;
@@ -615,6 +616,8 @@ impl JiraView {
                 .px_2()
                 .py_2()
                 .flex_1()
+                // See the jira-list note: min-height:0 makes the overflow scroll.
+                .min_h(px(0.))
                 .overflow_y_scroll()
                 .track_scroll(&self.picker_nav.scroll);
             for (idx, t) in picker.transitions.iter().enumerate() {
@@ -681,6 +684,10 @@ impl Render for JiraView {
                 .px_2()
                 .py_2()
                 .flex_1()
+                // min-height:0 lets this flex child shrink below its content so the
+                // overflow actually scrolls (without it the list grows to full
+                // content height and is clipped, unscrollably, by the chrome).
+                .min_h(px(0.))
                 .overflow_y_scroll()
                 .track_scroll(&self.nav.scroll);
             for (i, issue) in self.issues.iter().enumerate() {
