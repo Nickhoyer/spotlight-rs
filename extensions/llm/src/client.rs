@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use crate::websearch::{self, SearchCtx};
 use crate::{ApiFormat, Provider};
 
 /// System prompt for the launcher's chat. Two jobs: keep answers short, and —
@@ -24,16 +25,35 @@ use crate::{ApiFormat, Provider};
 const CONCISE_SYSTEM: &str = "You are a concise assistant embedded in a desktop launcher. \
 Keep answers short and direct — usually a sentence or two, or a short list. Skip preamble, \
 don't restate the question, and avoid filler; expand only when explicitly asked.\n\n\
-CRITICAL — you have NO internet access, NO tools, and NO real-time data. You cannot look \
-anything up. So you genuinely do not know anything that changes over time or depends on the \
-current moment or the user's location: the weather, today's date or time, current news, live \
-scores, stock or crypto prices, traffic, what's happening 'now', or the contents of any URL, \
-file, or account. If a question needs that kind of live or local information, do NOT guess, \
+CRITICAL — you have NO internet access and NO tools, so you cannot look anything up. The current \
+date, time, timezone and approximate location may be supplied to you as ambient context below; \
+when they are, rely on them. But for anything else that changes over time or depends on the live \
+world — the weather, current news, live scores, stock or crypto prices, traffic, what's happening \
+'now', or the contents of any URL, file, or account — you genuinely do not know it. Do NOT guess, \
 estimate, or make up a plausible-sounding answer — that is worse than no answer. Instead, say \
 plainly that you can't access it (e.g. \"I can't check the weather — I have no internet \
-access\"), and, if useful, point the user to where they could find it. Only answer from your \
+access\"), and, if useful, point the user to where they could find it. Otherwise answer from your \
 own trained knowledge, and when you're unsure or something may be outdated, say so rather than \
 inventing specifics.";
+
+/// System prompt used when the `web_search` tool is available. The inverse of
+/// [`CONCISE_SYSTEM`]'s "you have no internet" stance: the model *can* look
+/// things up, so it should — for anything live, recent, or uncertain — and cite
+/// what it finds instead of guessing.
+const SEARCH_SYSTEM: &str = "You are a concise assistant embedded in a desktop launcher. \
+Keep answers short and direct — usually a sentence or two, or a short list. Skip preamble, \
+don't restate the question, and avoid filler; expand only when explicitly asked.\n\n\
+You have a `web_search` tool backed by a privacy-preserving meta-search engine. Your own \
+knowledge is frozen at training time and you have no other live data, so whenever a question \
+depends on current, recent, local, or niche facts — news, weather, prices, scores, release \
+dates, documentation, anything after your cutoff or that may have changed — call `web_search` \
+rather than guessing. You may search more than once to refine or follow up. When you use \
+results, state the key facts and cite the sources as inline Markdown links. If a search turns \
+up nothing useful, say so plainly instead of inventing an answer.";
+
+/// Cap on tool round-trips per reply, so a misbehaving model can't loop forever.
+/// The final iteration runs with tools disabled to force a text answer.
+const MAX_TOOL_ROUNDS: usize = 5;
 
 /// A single chat message. Roles are `"user"` / `"assistant"`.
 #[derive(Debug, Clone)]
@@ -47,27 +67,70 @@ pub struct Message {
 pub enum StreamEvent {
     /// A chunk of assistant text.
     Delta(String),
+    /// A transient status line (e.g. "Searching the web…") shown while the agent
+    /// runs a tool between turns. Cleared once assistant text resumes.
+    Status(String),
+    /// A completed web search: the query the model chose and the full results
+    /// digest handed back to it. Rendered as an expandable entry in the log.
+    Search { query: String, results: String },
     /// The reply finished normally.
     Done,
     /// The request failed; carries a human-readable message.
     Error(String),
 }
 
+/// A tool call the model requested, accumulated across streamed deltas.
+#[derive(Debug, Default, Clone)]
+struct ToolCall {
+    id: String,
+    name: String,
+    /// Raw JSON arguments string, concatenated from streamed fragments.
+    arguments: String,
+}
+
+impl ToolCall {
+    /// The `query` argument, falling back to the raw arguments if the model sent
+    /// a bare string instead of the expected `{"query": "..."}` object.
+    fn query(&self) -> String {
+        serde_json::from_str::<Value>(&self.arguments)
+            .ok()
+            .and_then(|v| v.get("query").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| self.arguments.trim().trim_matches('"').to_string())
+    }
+
+    /// The arguments as a JSON *object*, for echoing an Anthropic `tool_use`
+    /// block (which requires an object input). Non-object or unparseable
+    /// arguments are normalized to `{"query": ...}`.
+    fn input(&self) -> Value {
+        match serde_json::from_str::<Value>(&self.arguments) {
+            Ok(v) if v.is_object() => v,
+            _ => json!({ "query": self.query() }),
+        }
+    }
+}
+
 /// Stream a chat completion for `messages`, pushing [`StreamEvent`]s to `tx`.
 ///
-/// Blocks until the stream ends, `cancel` is set, or the connection drops. `key`
+/// When `search` is `Some`, the model is offered a `web_search` tool and this
+/// runs an agentic loop — streaming text, executing any searches the model asks
+/// for, feeding the results back, and continuing until it produces a final text
+/// answer (see [`run_agent`]). When `None`, it's a single plain completion.
+///
+/// `context` is an optional ambient-context block (date/time, location, …)
+/// appended to the system prompt; pass `""` for none.
+///
+/// Blocks until the reply ends, `cancel` is set, or the connection drops. `key`
 /// is the API key (ignored for `provider.local`).
 pub fn stream(
     provider: &Provider,
     key: &str,
     messages: &[Message],
+    search: Option<&SearchCtx>,
+    context: &str,
     tx: UnboundedSender<StreamEvent>,
     cancel: Arc<AtomicBool>,
 ) {
-    let result = match provider.format {
-        ApiFormat::OpenAi => stream_openai(provider, key, messages, &tx, &cancel),
-        ApiFormat::Anthropic => stream_anthropic(provider, key, messages, &tx, &cancel),
-    };
+    let result = run_agent(provider, key, messages, search, context, &tx, &cancel);
     match result {
         Ok(()) => {
             let _ = tx.unbounded_send(StreamEvent::Done);
@@ -82,6 +145,88 @@ pub fn stream(
     }
 }
 
+/// The tool-calling loop. Maintains the wire conversation (format-specific JSON,
+/// seeded from the text history) and runs turns until the model answers with
+/// text instead of a tool call. Each turn streams its text to `tx`; a turn that
+/// ends in `web_search` calls triggers the searches, appends their results, and
+/// loops. The final iteration disables tools so the model must answer.
+fn run_agent(
+    provider: &Provider,
+    key: &str,
+    messages: &[Message],
+    search: Option<&SearchCtx>,
+    context: &str,
+    tx: &UnboundedSender<StreamEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let base = if search.is_some() { SEARCH_SYSTEM } else { CONCISE_SYSTEM };
+    // Append the ambient-context block (date/time, location, …) when present.
+    let system = if context.trim().is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\n\n{context}")
+    };
+    let system = system.as_str();
+    let mut wire: Vec<Value> = messages
+        .iter()
+        .map(|m| json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    for round in 0..=MAX_TOOL_ROUNDS {
+        // Advertise tools every round except the last (a forced text answer).
+        let tools = search.is_some() && round < MAX_TOOL_ROUNDS;
+        let calls = match provider.format {
+            ApiFormat::OpenAi => openai_turn(provider, key, system, &mut wire, tools, tx, cancel)?,
+            ApiFormat::Anthropic => anthropic_turn(provider, key, system, &mut wire, tools, tx, cancel)?,
+        };
+        if calls.is_empty() {
+            return Ok(()); // the model answered with text — done.
+        }
+        // Tools were only advertised when `search` is `Some`, so this holds.
+        let Some(ctx) = search else { return Ok(()) };
+
+        // Run each requested search on this thread, collecting the digests.
+        let mut results: Vec<(&ToolCall, String)> = Vec::with_capacity(calls.len());
+        for call in &calls {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let query = call.query();
+            let _ = tx.unbounded_send(StreamEvent::Status(format!(
+                "Searching the web for \u{201c}{query}\u{201d}\u{2026}"
+            )));
+            let digest = websearch::run(ctx, &query)
+                .unwrap_or_else(|e| format!("web_search failed: {e}. Answer as best you can."));
+            // Surface the completed search to the UI as an expandable log entry.
+            let _ = tx.unbounded_send(StreamEvent::Search {
+                query: query.clone(),
+                results: digest.clone(),
+            });
+            results.push((call, digest));
+        }
+
+        // Append the tool results in the shape each API expects, then loop.
+        match provider.format {
+            ApiFormat::OpenAi => {
+                for (call, digest) in &results {
+                    wire.push(json!({ "role": "tool", "tool_call_id": call.id, "content": digest }));
+                }
+            }
+            ApiFormat::Anthropic => {
+                // Anthropic wants all tool_results in one following user turn.
+                let content: Vec<Value> = results
+                    .iter()
+                    .map(|(call, digest)| {
+                        json!({ "type": "tool_result", "tool_use_id": call.id, "content": digest })
+                    })
+                    .collect();
+                wire.push(json!({ "role": "user", "content": content }));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -93,69 +238,132 @@ fn base(provider: &Provider) -> String {
     provider.base_url.trim_end_matches('/').to_string()
 }
 
-fn stream_openai(
+/// One OpenAI-compatible turn. Streams text deltas to `tx` and accumulates any
+/// `web_search` tool calls the model emits. On a tool call, echoes the
+/// assistant's tool-call turn into `wire` (so the follow-up results correlate)
+/// and returns the calls; otherwise returns an empty vec (the text answer).
+fn openai_turn(
     provider: &Provider,
     key: &str,
-    messages: &[Message],
+    system: &str,
+    wire: &mut Vec<Value>,
+    tools: bool,
     tx: &UnboundedSender<StreamEvent>,
     cancel: &Arc<AtomicBool>,
-) -> Result<(), String> {
-    // Prepend the concise system message before the conversation.
-    let mut msgs = vec![serde_json::json!({ "role": "system", "content": CONCISE_SYSTEM })];
-    msgs.extend(
-        messages
-            .iter()
-            .map(|m| serde_json::json!({ "role": m.role, "content": m.content })),
-    );
-    let body = serde_json::json!({
+) -> Result<Vec<ToolCall>, String> {
+    // Prepend the system message before the running conversation.
+    let mut msgs = vec![json!({ "role": "system", "content": system })];
+    msgs.extend(wire.iter().cloned());
+    let mut body = json!({
         "model": provider.model,
         "stream": true,
         "messages": msgs,
     });
+    if tools {
+        body["tools"] = json!([websearch::openai_tool()]);
+    }
     let mut req = agent().post(&format!("{}/chat/completions", base(provider)));
     if !provider.local && !key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {key}"));
     }
     let resp = req.send_json(body).map_err(describe_ureq)?;
 
+    // Tool calls stream as fragments across deltas, keyed by `index`.
+    let mut calls: Vec<ToolCall> = Vec::new();
     for_each_sse(resp.into_reader(), cancel, |data| {
         if data == "[DONE]" {
             return SseAction::Stop;
         }
-        if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-            if let Some(text) = chunk
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
-                .and_then(|d| d.get("content"))
-                .and_then(Value::as_str)
-            {
-                if !text.is_empty() {
-                    let _ = tx.unbounded_send(StreamEvent::Delta(text.to_string()));
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            return SseAction::Continue;
+        };
+        let Some(delta) =
+            chunk.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta"))
+        else {
+            return SseAction::Continue;
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                let _ = tx.unbounded_send(StreamEvent::Delta(text.to_string()));
+            }
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while calls.len() <= idx {
+                    calls.push(ToolCall::default());
+                }
+                let slot = &mut calls[idx];
+                if let Some(id) = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    slot.id = id.to_string();
+                }
+                let func = tc.get("function");
+                if let Some(name) =
+                    func.and_then(|f| f.get("name")).and_then(Value::as_str).filter(|s| !s.is_empty())
+                {
+                    slot.name = name.to_string();
+                }
+                if let Some(args) = func.and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                    slot.arguments.push_str(args);
                 }
             }
         }
         SseAction::Continue
-    })
+    })?;
+
+    // Keep only `web_search` calls (with our single tool, an unnamed call is one).
+    calls.retain(|c| c.name.is_empty() || c.name == websearch::TOOL_NAME);
+    for (i, c) in calls.iter_mut().enumerate() {
+        if c.id.is_empty() {
+            c.id = format!("call_{i}");
+        }
+    }
+
+    if !calls.is_empty() {
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": websearch::TOOL_NAME, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        wire.push(json!({ "role": "assistant", "content": Value::Null, "tool_calls": tool_calls }));
+    }
+    Ok(calls)
 }
 
-fn stream_anthropic(
+/// One accumulated Anthropic content block: streamed text, or a tool-use call.
+enum Block {
+    Text(String),
+    Tool(ToolCall),
+}
+
+/// One Anthropic Messages turn. Mirrors [`openai_turn`]: streams text to `tx`,
+/// accumulates `tool_use` blocks, and — on a tool call — echoes the assistant
+/// turn (text + tool_use blocks) into `wire` before returning the calls.
+fn anthropic_turn(
     provider: &Provider,
     key: &str,
-    messages: &[Message],
+    system: &str,
+    wire: &mut Vec<Value>,
+    tools: bool,
     tx: &UnboundedSender<StreamEvent>,
     cancel: &Arc<AtomicBool>,
-) -> Result<(), String> {
+) -> Result<Vec<ToolCall>, String> {
     // Anthropic takes the system prompt as a top-level field, not a message.
-    let body = serde_json::json!({
+    let mut body = json!({
         "model": provider.model,
         "max_tokens": 4096,
         "stream": true,
-        "system": CONCISE_SYSTEM,
-        "messages": messages.iter().map(|m| serde_json::json!({
-            "role": m.role, "content": m.content,
-        })).collect::<Vec<_>>(),
+        "system": system,
+        "messages": wire.clone(),
     });
+    if tools {
+        body["tools"] = json!([websearch::anthropic_tool()]);
+    }
     let resp = agent()
         .post(&format!("{}/messages", base(provider)))
         .set("x-api-key", key)
@@ -163,19 +371,50 @@ fn stream_anthropic(
         .send_json(body)
         .map_err(describe_ureq)?;
 
+    // Content blocks arrive in order: each `content_block_start` opens a block at
+    // an index, deltas fill it, `content_block_stop` closes it.
+    let mut blocks: Vec<Block> = Vec::new();
     for_each_sse(resp.into_reader(), cancel, |data| {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return SseAction::Continue;
         };
         match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let cb = event.get("content_block");
+                match cb.and_then(|c| c.get("type")).and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        let id = cb
+                            .and_then(|c| c.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = cb
+                            .and_then(|c| c.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        blocks.push(Block::Tool(ToolCall { id, name, arguments: String::new() }));
+                    }
+                    _ => blocks.push(Block::Text(String::new())),
+                }
+                SseAction::Continue
+            }
             Some("content_block_delta") => {
-                if let Some(text) = event
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(Value::as_str)
-                {
+                let idx = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let delta = event.get("delta");
+                if let Some(text) = delta.and_then(|d| d.get("text")).and_then(Value::as_str) {
                     if !text.is_empty() {
                         let _ = tx.unbounded_send(StreamEvent::Delta(text.to_string()));
+                        if let Some(Block::Text(s)) = blocks.get_mut(idx) {
+                            s.push_str(text);
+                        }
+                    }
+                }
+                if let Some(pj) =
+                    delta.and_then(|d| d.get("partial_json")).and_then(Value::as_str)
+                {
+                    if let Some(Block::Tool(tc)) = blocks.get_mut(idx) {
+                        tc.arguments.push_str(pj);
                     }
                 }
                 SseAction::Continue
@@ -192,7 +431,26 @@ fn stream_anthropic(
             }
             _ => SseAction::Continue,
         }
-    })
+    })?;
+
+    // Split the blocks into tool calls plus the assistant turn to echo back.
+    let mut calls: Vec<ToolCall> = Vec::new();
+    let mut echo: Vec<Value> = Vec::new();
+    for block in &blocks {
+        match block {
+            Block::Text(s) if !s.is_empty() => echo.push(json!({ "type": "text", "text": s })),
+            Block::Text(_) => {}
+            Block::Tool(tc) if tc.name == websearch::TOOL_NAME => {
+                echo.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input() }));
+                calls.push(tc.clone());
+            }
+            Block::Tool(_) => {} // unknown tool — ignore.
+        }
+    }
+    if !calls.is_empty() {
+        wire.push(json!({ "role": "assistant", "content": echo }));
+    }
+    Ok(calls)
 }
 
 enum SseAction {
@@ -419,7 +677,7 @@ mod tests {
     fn collect(provider: &Provider) -> Vec<StreamEvent> {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
-        stream(provider, "", &[Message { role: "user".into(), content: "hi".into() }], tx, cancel);
+        stream(provider, "", &[Message { role: "user".into(), content: "hi".into() }], None, "", tx, cancel);
         futures::executor::block_on(async {
             let mut out = Vec::new();
             while let Some(ev) = rx.next().await {
@@ -437,6 +695,29 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn tool_call_query_parses_json_and_falls_back() {
+        // Well-formed arguments — extract the `query` field.
+        let tc = ToolCall {
+            id: "c1".into(),
+            name: "web_search".into(),
+            arguments: r#"{"query":"rust lifetimes"}"#.into(),
+        };
+        assert_eq!(tc.query(), "rust lifetimes");
+        assert_eq!(tc.input(), json!({ "query": "rust lifetimes" }));
+
+        // A bare JSON string instead of an object — fall back to the raw value,
+        // unquoted, and still produce a valid `{query: ...}` input.
+        let bare = ToolCall { arguments: r#""weather in oslo""#.into(), ..Default::default() };
+        assert_eq!(bare.query(), "weather in oslo");
+        assert_eq!(bare.input(), json!({ "query": "weather in oslo" }));
+
+        // Garbage arguments — query is the raw text; input wraps it.
+        let junk = ToolCall { arguments: "not json".into(), ..Default::default() };
+        assert_eq!(junk.query(), "not json");
+        assert_eq!(junk.input(), json!({ "query": "not json" }));
     }
 
     #[test]

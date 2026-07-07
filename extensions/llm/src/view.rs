@@ -20,19 +20,45 @@ use spotlight_ui::theme;
 use crate::client::{self, Message, StreamEvent};
 use crate::{load_config, markdown, secret_key, LlmConfig};
 
+/// One item in the visible transcript.
+enum Entry {
+    /// A message the user sent.
+    User(String),
+    /// A finished assistant reply (Markdown).
+    Assistant(String),
+    /// A completed web search the agent ran, expandable to show the raw results
+    /// the tool returned.
+    Search(SearchLog),
+}
+
+/// A logged `web_search` tool call: the query the model chose, the full results
+/// digest it received, and whether the user has expanded it.
+struct SearchLog {
+    query: String,
+    results: String,
+    expanded: bool,
+}
+
 pub struct LlmView {
     config: LlmConfig,
     /// Flattened `(provider index, model id)` pairs the switcher cycles through.
     options: Vec<(usize, String)>,
     /// Current index into `options`.
     sel: usize,
-    /// Conversation so far (roles `user` / `assistant`).
-    messages: Vec<Message>,
+    /// The visible transcript: user/assistant messages plus expandable
+    /// web-search entries, in display order. The LLM history sent on each turn
+    /// is derived from this (search entries are display-only) — see [`history`].
+    ///
+    /// [`history`]: Self::history
+    entries: Vec<Entry>,
     input: gpui::Entity<TextInput>,
     /// True while a reply is streaming.
     streaming: bool,
     /// The in-progress assistant reply, appended token-by-token.
     partial: String,
+    /// Transient agent status (e.g. "Searching the web…"), shown before the
+    /// answer starts streaming. Cleared once text arrives.
+    status: Option<String>,
     error: Option<String>,
     /// Flips a running stream off (Esc); the client drops the connection.
     cancel: Arc<AtomicBool>,
@@ -68,10 +94,11 @@ impl LlmView {
             config,
             options,
             sel,
-            messages: Vec::new(),
+            entries: Vec::new(),
             input,
             streaming: false,
             partial: String::new(),
+            status: None,
             error: None,
             cancel: Arc::new(AtomicBool::new(false)),
             transcript_scroll: ScrollHandle::new(),
@@ -86,6 +113,14 @@ impl LlmView {
         if std::env::var_os("SPOTLIGHT_LLM_DEMO").is_some() {
             view.seed_demo();
             return view;
+        }
+
+        // Warm the cached IP location in the background so it's ready by the time
+        // a reply needs it (best-effort; refreshes at most once a day).
+        if view.config.ambient_context {
+            cx.background_executor()
+                .spawn(async { crate::ambient::refresh_location_if_stale() })
+                .detach();
         }
 
         // Auto-send the search text the panel was opened from.
@@ -107,10 +142,18 @@ impl LlmView {
             - bullet two with `code`\n\n\
             ```\nfn main() {\n    println!(\"hello from a code block\");\n}\n```\n\n\
             > And a short blockquote to finish.";
-        self.messages = vec![
-            Message { role: "user".into(), content: "Show me what markdown looks like.".into() },
-            Message { role: "assistant".into(), content: assistant.into() },
-            Message { role: "user".into(), content: "Great — now stream a bit.".into() },
+        self.entries = vec![
+            Entry::User("Show me what markdown looks like.".into()),
+            Entry::Assistant(assistant.into()),
+            Entry::User("Great — now stream a bit.".into()),
+            Entry::Search(SearchLog {
+                query: "gpui markdown rendering".into(),
+                results: "Search results for \"gpui markdown rendering\":\n\n\
+                    - GPUI — Zed's GPU UI framework\n  https://zed.dev/gpui\n  A fast, GPU-accelerated UI framework.\n\n\
+                    - Rendering text in GPUI\n  https://example.dev/gpui-text\n  Notes on text runs and wrapping."
+                    .into(),
+                expanded: false,
+            }),
         ];
         self.partial =
             "Sure! This reply is currently streaming, and it is long enough that it should wrap onto a second line with a thin caret trailing the last word.".into();
@@ -154,9 +197,10 @@ impl LlmView {
         };
         provider.model = model;
 
-        self.messages.push(Message { role: "user".into(), content: text });
+        self.entries.push(Entry::User(text));
         self.error = None;
         self.partial.clear();
+        self.status = None;
         self.streaming = true;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = cancel.clone();
@@ -166,13 +210,24 @@ impl LlmView {
         } else {
             spotlight_config::load_secret(&secret_key(&provider.name)).unwrap_or_default()
         };
-        let history = self.messages.clone();
+        // Resolve the web-search tool for this reply (its key lives in the secret
+        // store); `None` when search is disabled.
+        let search = self.config.search.enabled.then(|| crate::websearch::SearchCtx {
+            endpoint: self.config.search.endpoint.clone(),
+            key: spotlight_config::load_secret(crate::SEARCH_SECRET_KEY).filter(|s| !s.is_empty()),
+            max_results: self.config.search.max_results,
+        });
+        let ambient_on = self.config.ambient_context;
+        let history = self.history();
         let (tx, mut rx) = mpsc::unbounded();
 
-        // Producer: blocking SSE read on the background executor.
+        // Producer: blocking SSE read on the background executor. The ambient
+        // context (date/time/location) is built here, off the UI thread, since it
+        // shells out to `date`/`defaults`.
         cx.background_executor()
             .spawn(async move {
-                client::stream(&provider, &key, &history, tx, cancel);
+                let context = if ambient_on { crate::ambient::system_context() } else { String::new() };
+                client::stream(&provider, &key, &history, search.as_ref(), &context, tx, cancel);
             })
             .detach();
 
@@ -202,7 +257,28 @@ impl LlmView {
         }
         match ev {
             StreamEvent::Delta(s) => {
+                // First text after a search clears the status line.
+                self.status = None;
                 self.partial.push_str(&s);
+                self.transcript_scroll.scroll_to_bottom();
+                cx.notify();
+                false
+            }
+            StreamEvent::Status(s) => {
+                self.status = Some(s);
+                self.transcript_scroll.scroll_to_bottom();
+                cx.notify();
+                false
+            }
+            StreamEvent::Search { query, results } => {
+                // Commit any assistant text streamed before the search as its own
+                // bubble, so the search entry lands between it and the follow-up
+                // answer rather than splitting a single bubble.
+                if !self.partial.is_empty() {
+                    self.entries.push(Entry::Assistant(std::mem::take(&mut self.partial)));
+                }
+                self.status = None;
+                self.entries.push(Entry::Search(SearchLog { query, results, expanded: false }));
                 self.transcript_scroll.scroll_to_bottom();
                 cx.notify();
                 false
@@ -219,15 +295,34 @@ impl LlmView {
         }
     }
 
+    /// The LLM history to send: user/assistant messages only (search entries are
+    /// display-only — the model already saw those results mid-stream).
+    fn history(&self) -> Vec<Message> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::User(t) => Some(Message { role: "user".into(), content: t.clone() }),
+                Entry::Assistant(t) => Some(Message { role: "assistant".into(), content: t.clone() }),
+                Entry::Search(_) => None,
+            })
+            .collect()
+    }
+
+    /// Toggle an expandable search entry open/closed.
+    fn toggle_search(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(Entry::Search(log)) = self.entries.get_mut(i) {
+            log.expanded = !log.expanded;
+            cx.notify();
+        }
+    }
+
     /// Commit the streamed reply to history and clear the streaming state.
     fn finish(&mut self, cx: &mut Context<Self>) {
         if !self.partial.is_empty() {
-            self.messages.push(Message {
-                role: "assistant".into(),
-                content: std::mem::take(&mut self.partial),
-            });
+            self.entries.push(Entry::Assistant(std::mem::take(&mut self.partial)));
         }
         self.partial.clear();
+        self.status = None;
         self.streaming = false;
         self.transcript_scroll.scroll_to_bottom();
         cx.notify();
@@ -301,7 +396,7 @@ impl LlmView {
             .into_any_element()
     }
 
-    fn transcript(&self) -> AnyElement {
+    fn transcript(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div()
             .id("llm-transcript")
             .flex()
@@ -316,7 +411,7 @@ impl LlmView {
             .overflow_y_scroll()
             .track_scroll(&self.transcript_scroll);
 
-        if self.messages.is_empty() && !self.streaming && self.error.is_none() {
+        if self.entries.is_empty() && !self.streaming && self.error.is_none() {
             list = list.child(
                 div()
                     .flex_1()
@@ -332,11 +427,15 @@ impl LlmView {
             );
         }
 
-        for m in &self.messages {
-            list = list.child(bubble(&m.role, &m.content));
+        for (i, entry) in self.entries.iter().enumerate() {
+            list = list.child(match entry {
+                Entry::User(text) => bubble("user", text),
+                Entry::Assistant(text) => bubble("assistant", text),
+                Entry::Search(log) => self.search_entry(i, log, cx),
+            });
         }
         if self.streaming || !self.partial.is_empty() {
-            list = list.child(streaming_bubble(&self.partial));
+            list = list.child(streaming_bubble(&self.partial, self.status.as_deref()));
         }
         if let Some(err) = &self.error {
             list = list.child(
@@ -351,6 +450,55 @@ impl LlmView {
         }
 
         list.into_any_element()
+    }
+
+    /// An expandable "Searched the web" entry. The header row (query + chevron)
+    /// toggles open to reveal the raw results the tool handed the model.
+    fn search_entry(&self, i: usize, log: &SearchLog, cx: &mut Context<Self>) -> AnyElement {
+        let chevron = if log.expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ / ▸
+
+        let head = div()
+            .id(("llm-search", i))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(theme::tile())
+            .text_xs()
+            .text_color(theme::muted())
+            .hover(|s| s.bg(theme::hover_strong()))
+            .child(div().text_color(theme::accent()).child(chevron))
+            .child("\u{1f50e}") // 🔎
+            .child(div().text_color(theme::text()).child("Searched the web"))
+            .child(div().child(format!("\u{00b7} \u{201c}{}\u{201d}", log.query)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.toggle_search(i, cx)),
+            );
+
+        let mut card = div().flex().flex_col().gap_2().max_w(px(BUBBLE_MAX)).w_full().child(head);
+
+        if log.expanded {
+            // Render the tool output verbatim, line by line (blank lines preserved
+            // as spacing between hits).
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(theme::hover())
+                .text_xs()
+                .text_color(theme::muted());
+            for line in log.results.lines() {
+                body = body.child(div().child(line.to_string()));
+            }
+            card = card.child(body);
+        }
+
+        row(false, card)
     }
 
     fn composer(&self) -> AnyElement {
@@ -388,7 +536,7 @@ impl Render for LlmView {
             .flex_col()
             .child(self.header(cx))
             .child(div().h(px(1.)).bg(theme::divider()))
-            .child(self.transcript())
+            .child(self.transcript(cx))
             .child(div().h(px(1.)).bg(theme::divider()))
             .child(self.composer())
     }
@@ -411,12 +559,14 @@ fn bubble(role: &str, text: &str) -> AnyElement {
 }
 
 /// The in-progress assistant reply: plain wrapped text (Markdown is applied once
-/// it finalizes) followed by a thin, blinking caret. Shows "Thinking…" before
-/// the first token arrives.
-fn streaming_bubble(partial: &str) -> AnyElement {
+/// it finalizes) followed by a thin, blinking caret. Before the first token
+/// arrives it shows the current agent status ("Searching the web…") if one is
+/// set, otherwise "Thinking…".
+fn streaming_bubble(partial: &str, status: Option<&str>) -> AnyElement {
     let mut body = bubble_body(false).flex().flex_row().flex_wrap().items_end().gap_1();
     if partial.is_empty() {
-        body = body.child(div().text_color(theme::muted()).child("Thinking\u{2026}"));
+        let note = status.unwrap_or("Thinking\u{2026}");
+        body = body.child(div().text_color(theme::muted()).child(note.to_string()));
     } else {
         // Split into words so the row wraps and the caret trails the last word.
         // (Markdown styling is applied once the reply finalizes.)

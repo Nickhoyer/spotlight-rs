@@ -195,10 +195,15 @@ impl LlmSettingsTab {
         }
         let active = self.active.min(providers.len().saturating_sub(1));
 
+        // Preserve the config-only settings that have no UI on this tab.
+        let existing = crate::load_config();
+        let search = existing.search;
+        let ambient_context = existing.ambient_context;
+
         let mut cfg = AppConfig::load();
         let _ = cfg.set(
             crate::EXT_ID,
-            &LlmConfig { providers, active, autocomplete: self.autocomplete },
+            &LlmConfig { providers, active, autocomplete: self.autocomplete, search, ambient_context },
         );
         self.status = Some(match cfg.save() {
             Ok(()) => "Saved. Reopen AI Chat to use the new settings.".to_string(),

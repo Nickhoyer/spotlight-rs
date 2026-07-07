@@ -10,12 +10,14 @@
 //! shape (OpenAI, Groq, OpenRouter, Ollama, LM Studio, …) and the Anthropic
 //! Messages API. Both stream token-by-token over Server-Sent Events.
 
+mod ambient;
 mod autocomplete;
 mod client;
 mod markdown;
 mod search;
 mod settings_tab;
 mod view;
+mod websearch;
 
 pub use search::LlmSearch;
 
@@ -65,6 +67,46 @@ pub struct Provider {
     pub local: bool,
 }
 
+/// Web-search settings for the agent's `web_search` tool. Backed by a Degoog
+/// meta-search server; defaults to the project's hosted instance so it works out
+/// of the box. There's no Settings UI for this yet — edit the config file (or the
+/// secret store for the key) to change it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// When on, chats advertise a `web_search` tool the model can call for live
+    /// or niche facts. On by default.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Degoog search endpoint (GET `?q=`). The hosted instance by default.
+    #[serde(default = "default_search_endpoint")]
+    pub endpoint: String,
+    /// How many results to hand back to the model per search.
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+}
+
+fn default_search_endpoint() -> String {
+    "https://degoog.org/api/search".to_string()
+}
+
+fn default_max_results() -> usize {
+    5
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: default_search_endpoint(),
+            max_results: default_max_results(),
+        }
+    }
+}
+
+/// Secret-store key for the search endpoint's Bearer token (optional — the
+/// hosted Degoog instance is usable without one).
+pub const SEARCH_SECRET_KEY: &str = "llm-search-key";
+
 /// Persisted AI settings (provider API keys live in the secret store).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
@@ -77,6 +119,14 @@ pub struct LlmConfig {
     /// "Ask AI" suggestion rows. On by default.
     #[serde(default = "default_true")]
     pub autocomplete: bool,
+    /// Web-search tool settings for the chat agent.
+    #[serde(default)]
+    pub search: SearchConfig,
+    /// Whether to give the agent ambient context — current date/time, timezone,
+    /// locale, and coarse IP location — in its system prompt. On by default; the
+    /// IP lookup (cached, once a day) is the only part that touches the network.
+    #[serde(default = "default_true")]
+    pub ambient_context: bool,
 }
 
 fn default_true() -> bool {
@@ -85,7 +135,13 @@ fn default_true() -> bool {
 
 impl Default for LlmConfig {
     fn default() -> Self {
-        Self { providers: Vec::new(), active: 0, autocomplete: true }
+        Self {
+            providers: Vec::new(),
+            active: 0,
+            autocomplete: true,
+            search: SearchConfig::default(),
+            ambient_context: true,
+        }
     }
 }
 
