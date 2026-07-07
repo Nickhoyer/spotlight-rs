@@ -84,7 +84,10 @@ pub fn faded_scroll(scroll: &ScrollHandle, fill: bool, inner: AnyElement) -> Any
 
     let mut wrapper = div().relative();
     if fill {
-        wrapper = wrapper.flex().flex_col().flex_1();
+        // `min_h(0)` so this flex wrapper can shrink below its content and let the
+        // inner scroll container actually scroll (rather than growing to full
+        // content height and being clipped by the chrome).
+        wrapper = wrapper.flex().flex_col().flex_1().min_h(px(0.));
     }
     wrapper
         .child(inner)
