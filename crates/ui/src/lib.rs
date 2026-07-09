@@ -200,6 +200,9 @@ pub struct SpotlightView {
     /// Settings tabs `(title, view)`, built on entering Settings, cleared on leave.
     settings_tabs: Vec<(String, AnyView)>,
     settings_active: usize,
+    /// Focus handles for the settings tab-rail chips (parallel to `settings_tabs`),
+    /// so the rail is Tab-reachable. Rebuilt in `go_settings`, cleared on leave.
+    settings_tab_focuses: Vec<FocusHandle>,
     /// Home keyboard selection + scroll handles for its two lists.
     home_sel: HomeSel,
     recents_scroll: gpui::ScrollHandle,
@@ -224,6 +227,10 @@ pub struct SpotlightView {
     /// Current rendered panel height, eased toward the active screen's target
     /// height each frame (`None` until the first render snaps it to target).
     cur_h: Option<f32>,
+    /// Current rendered panel width, eased toward the active screen's target width
+    /// each frame (`None` until the first render snaps it to target). Lets Settings
+    /// be wider than Home without a jump.
+    cur_w: Option<f32>,
     /// Timestamp of the previous render, for the height easing's delta-time.
     last_frame: Instant,
     /// Active horizontal slide between screens of different depth.
@@ -290,6 +297,7 @@ impl SpotlightView {
             panel: None,
             settings_tabs: Vec::new(),
             settings_active: 0,
+            settings_tab_focuses: Vec::new(),
             home_sel: HomeSel::Shortcuts(0),
             recents_scroll: gpui::ScrollHandle::new(),
             shortcuts_scroll: gpui::ScrollHandle::new(),
@@ -299,6 +307,7 @@ impl SpotlightView {
             exiting: false,
             exit_task: None,
             cur_h: None,
+            cur_w: None,
             last_frame: Instant::now(),
             slide: None,
             hl_x: 0.,
@@ -397,6 +406,7 @@ impl SpotlightView {
         for f in &self.ui.settings_tabs {
             tabs.push((f.title.clone(), (f.make_view)(cx)));
         }
+        self.settings_tab_focuses = tabs.iter().map(|_| cx.focus_handle()).collect();
         self.settings_tabs = tabs;
         self.settings_active = 0;
         self.screen = Screen::Settings;
@@ -464,6 +474,7 @@ impl SpotlightView {
         }
         if !matches!(self.screen, Screen::Settings) {
             self.settings_tabs.clear();
+            self.settings_tab_focuses.clear();
         }
     }
 
@@ -488,6 +499,24 @@ impl SpotlightView {
                 }
             }
             Screen::Settings | Screen::Extension(_) => PANEL_H,
+        }
+    }
+
+    /// Target panel width for a screen. Settings (and extension panels) are wider
+    /// than the search-shaped Home/Search so a proper settings layout fits.
+    fn panel_width(&self, screen: &Screen) -> f32 {
+        match screen {
+            Screen::Home | Screen::Search => OPEN_BASE_W,
+            Screen::Settings | Screen::Extension(_) => SETTINGS_W,
+        }
+    }
+
+    /// Top offset of the panel within the window for a screen. The large Settings
+    /// panel sits higher than the search-shaped screens so it reads as centered.
+    fn panel_top(&self, screen: &Screen) -> f32 {
+        match screen {
+            Screen::Home | Screen::Search => PANEL_TOP,
+            Screen::Settings | Screen::Extension(_) => SETTINGS_TOP,
         }
     }
 
@@ -795,9 +824,10 @@ impl SpotlightView {
         // Cancel any in-flight exit (drops the timer task) and drop the reverse.
         self.exit_task = None;
         self.exiting = false;
-        // Snap height to the (Home) target so it doesn't ease down from the last
-        // screen's height while the open animation plays.
+        // Snap height/width to the (Home) target so they don't ease from the last
+        // screen's size while the open animation plays.
         self.cur_h = None;
+        self.cur_w = None;
         self.slide = None;
         spotlight_platform_macos::window::show_panel(ns_view);
         // Restart the springy open-reveal from the next frame.
@@ -865,10 +895,10 @@ impl SpotlightView {
             return;
         }
 
-        // Settings: keyboard navigation. Left/Right switch tabs (only reaches
-        // here when no text field is focused — focused fields consume arrows and
-        // stop propagation), Tab/Shift-Tab move focus between fields, Enter steps
-        // into the form.
+        // Settings: keyboard navigation. Up/Down move between sidebar categories
+        // (only reaches here when no text field is focused — focused fields consume
+        // arrows and stop propagation), Tab/Shift-Tab move focus into/among the
+        // content pane's controls, Enter steps forward.
         if self.screen == Screen::Settings {
             match key.as_str() {
                 "tab" => {
@@ -879,13 +909,19 @@ impl SpotlightView {
                     }
                 }
                 "enter" => window.focus_next(cx),
-                "left" => {
+                "up" => {
                     self.settings_active = self.settings_active.saturating_sub(1);
+                    if let Some(f) = self.settings_tab_focuses.get(self.settings_active).cloned() {
+                        window.focus(&f, cx);
+                    }
                     cx.notify();
                 }
-                "right" => {
+                "down" => {
                     if self.settings_active + 1 < self.settings_tabs.len() {
                         self.settings_active += 1;
+                        if let Some(f) = self.settings_tab_focuses.get(self.settings_active).cloned() {
+                            window.focus(&f, cx);
+                        }
                         cx.notify();
                     }
                 }
@@ -1155,33 +1191,52 @@ impl SpotlightView {
         col.into_any_element()
     }
 
-    /// Inner content for Settings (header + tabs + active tab body, no chrome).
+    /// Inner content for Settings: a left sidebar of categories + a wide, scrollable
+    /// content pane holding the active tab. Modern-settings shape (System Settings /
+    /// VSCode) rather than a tab rail over a form.
     fn settings_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let active = self.settings_active;
-        let mut rail = div().flex().items_center().gap_1().px_2().pt_2().pb_2();
+
+        // Left sidebar: one nav row per tab, keyboard-reachable.
+        let mut nav = div().flex().flex_col().gap_1().w(px(210.)).flex_shrink_0().p_3();
         for (i, (title, _)) in self.settings_tabs.iter().enumerate() {
             let selected = i == active;
-            rail = rail.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded_lg()
-                    .when(selected, |t| t.bg(theme::selected()))
-                    .hover(|s| s.bg(theme::hover()))
-                    .text_color(if selected {
-                        theme::accent()
-                    } else {
-                        theme::muted()
-                    })
-                    .child(title.clone())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+            let glyph = settings_glyph(title);
+            let mut item = div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(gpui::rgba(0x00_0000_00))
+                .when(selected, |t| t.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .focus(|s| s.border_color(theme::accent()))
+                .text_color(if selected { theme::accent() } else { theme::muted() })
+                .child(div().w(px(16.)).flex_shrink_0().text_center().child(glyph))
+                .child(div().child(title.clone()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.settings_active = i;
+                        cx.notify();
+                    }),
+                )
+                .on_key_down(cx.listener(
+                    move |this, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>| {
+                        if ev.keystroke.key == "enter" || ev.keystroke.key == "space" {
                             this.settings_active = i;
+                            cx.stop_propagation();
                             cx.notify();
-                        }),
-                    ),
-            );
+                        }
+                    },
+                ));
+            if let Some(f) = self.settings_tab_focuses.get(i) {
+                item = item.track_focus(f).tab_index(0);
+            }
+            nav = nav.child(item);
         }
 
         let body = self
@@ -1190,16 +1245,28 @@ impl SpotlightView {
             .map(|(_, view)| view.clone().into_any_element())
             .unwrap_or_else(|| div().into_any_element());
 
+        // Content pane: scrolls, with the active tab in a width-capped column so
+        // fields don't stretch ultra-wide.
+        let pane = div()
+            .id("settings-pane")
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px_8()
+            .py_6()
+            .child(div().w_full().max_w(px(680.)).child(body));
+
         shell_content(
             "Settings",
             cx,
             div()
                 .flex()
-                .flex_col()
+                .flex_row()
                 .size_full()
-                .child(rail)
-                .child(div().h(px(1.)).bg(theme::divider()))
-                .child(div().flex_1().overflow_hidden().px_5().py_4().child(body)),
+                .child(nav)
+                .child(div().w(px(1.)).h_full().bg(theme::divider()))
+                .child(pane),
         )
     }
 
@@ -1257,6 +1324,27 @@ impl SpotlightView {
         };
         self.cur_h = Some(h);
         h
+    }
+
+    /// Advance the eased panel width toward the active screen's target and return
+    /// it, requesting another frame while still moving. Mirrors [`tick_height`].
+    fn tick_width(&mut self, dt: f32, window: &Window) -> f32 {
+        let target = self.panel_width(&self.screen);
+        let w = match self.cur_w {
+            None => target,
+            Some(cur) => {
+                let k = 1.0 - (-dt / HEIGHT_TAU).exp();
+                let next = cur + (target - cur) * k;
+                if (next - target).abs() < 0.5 {
+                    target
+                } else {
+                    window.request_animation_frame();
+                    next
+                }
+            }
+        };
+        self.cur_w = Some(w);
+        w
     }
 
     /// Measured rect of item `ix` in `scroll`, in scroll-content coordinates
@@ -1410,6 +1498,9 @@ impl SpotlightView {
         self.last_frame = now;
         self.tick_highlight(dt, window);
         let h = self.tick_height(dt, window);
+        // Eased current width (Home 680 → Settings 760); the reveal wrapper owns it
+        // and everything below fills it, so it morphs smoothly across a slide.
+        let w = self.tick_width(dt, window);
 
         let Some(slide) = self.slide.clone() else {
             let screen = self.screen.clone();
@@ -1426,15 +1517,16 @@ impl SpotlightView {
         let to_screen = self.screen.clone();
         let from_content = self.content_for(&slide.from, cx);
         let to_content = self.content_for(&to_screen, cx);
-        let cell = |content: AnyElement| {
-            div().w(px(OPEN_BASE_W)).flex_shrink_0().child(content)
-        };
-        // Forward: [from, to], track slides left (0 → -W). Back: [to, from], track
-        // slides right (-W → 0). Either way the incoming screen ends centered.
+        // Both cells fill the eased viewport width `w`; the track is 2w wide and
+        // shifts by w so the incoming screen ends centered while the panel's width
+        // eases toward the target screen's width.
+        let cell = move |content: AnyElement| div().w(px(w)).flex_shrink_0().child(content);
+        // Forward: [from, to], track slides left (0 → -w). Back: [to, from], track
+        // slides right (-w → 0). Either way the incoming screen ends centered.
         let (left, right, offset) = if slide.forward {
-            (cell(from_content), cell(to_content), -OPEN_BASE_W * e)
+            (cell(from_content), cell(to_content), -w * e)
         } else {
-            (cell(to_content), cell(from_content), -OPEN_BASE_W * (1.0 - e))
+            (cell(to_content), cell(from_content), -w * (1.0 - e))
         };
         let track = div()
             .flex()
@@ -1457,8 +1549,9 @@ impl Render for SpotlightView {
             }
         }
 
-        // Same top offset on every screen so the panel's top edge stays put when
-        // navigating (otherwise Settings/extension panels jump upward).
+        // Per-screen top offset: search-shaped screens sit low (140); the large
+        // Settings panel sits higher (60) so it reads as centered.
+        let top = self.panel_top(&self.screen);
         let body = self.render_body(window, cx);
 
         div()
@@ -1473,7 +1566,7 @@ impl Render for SpotlightView {
             .flex()
             .flex_col()
             .items_center()
-            .pt(px(PANEL_TOP))
+            .pt(px(top))
             .child(self.open_reveal(body, window))
     }
 }
@@ -1509,16 +1602,22 @@ const EXIT_FALL_PX: f32 = 260.0;
 /// Fade-out speed relative to the fall. >1 so the panel is invisible well before
 /// it falls far enough to clip at the window's bottom edge.
 const EXIT_FADE_GAIN: f32 = 1.35;
-/// Resting panel width; the open-reveal container owns it and the inner panels
-/// fill it (`w_full`), so animating this scales the whole panel.
+/// Resting panel width for the search-shaped screens (Home/Search); the
+/// open-reveal container owns it and the inner panels fill it (`w_full`), so
+/// animating this scales the whole panel.
 const OPEN_BASE_W: f32 = 680.0;
-/// Top offset of the panel within the window, shared by every screen so the top
-/// edge stays fixed when navigating. The 440px-tall panels fit below it.
+/// Resting panel width for Settings + extension panels — wider than Home so a
+/// proper settings layout fits. The width eases between screens (like height).
+const SETTINGS_W: f32 = 1040.0;
+/// Top offset for the search-shaped screens (Home/Search). Settings uses a
+/// smaller offset (`SETTINGS_TOP`) so its large panel sits higher / more centered.
 const PANEL_TOP: f32 = 140.0;
+/// Top offset for the large Settings / extension panels.
+const SETTINGS_TOP: f32 = 60.0;
 
 // --- Per-screen heights, so the panel can animate its height between screens. ---
 /// Settings + extension panels (fixed).
-const PANEL_H: f32 = 440.0;
+const PANEL_H: f32 = 640.0;
 const SEARCH_ROW_H: f32 = 64.0;
 const DIVIDER_H: f32 = 1.0;
 const SECTION_LABEL_H: f32 = 32.0;
@@ -1637,8 +1736,10 @@ impl SpotlightView {
     /// `GlobalElementId` and reset the per-screen fades on every show/hide.
     /// Skipped under capture so screenshots stay crisp.
     fn open_reveal(&self, body: AnyElement, window: &Window) -> AnyElement {
+        // Current eased panel width (set by `tick_width` during `render_body`).
+        let base_w = self.cur_w.unwrap_or_else(|| self.panel_width(&self.screen));
         if std::env::var_os("SPOTLIGHT_CAPTURE").is_some() {
-            return div().w(px(OPEN_BASE_W)).child(body).into_any_element();
+            return div().w(px(base_w)).child(body).into_any_element();
         }
         let secs = self.reveal_start.elapsed().as_secs_f32();
         if self.exiting {
@@ -1659,7 +1760,7 @@ impl SpotlightView {
             window.request_animation_frame();
         }
         div()
-            .w(px(OPEN_BASE_W * scale))
+            .w(px(base_w * scale))
             .child(body)
             .blur(px(blur))
             .opacity(opacity)
@@ -1670,6 +1771,7 @@ impl SpotlightView {
     /// a body released from rest under constant acceleration, so the offset grows
     /// with the square of elapsed time (`y = ½·g·t²`).
     fn exit_fall(&self, body: AnyElement, secs: f32, window: &Window) -> AnyElement {
+        let base_w = self.cur_w.unwrap_or_else(|| self.panel_width(&self.screen));
         let raw = (secs / (EXIT_MS as f32 / 1000.0)).clamp(0.0, 1.0);
         let fall = EXIT_FALL_PX * raw * raw;
         let opacity = (1.0 - raw * EXIT_FADE_GAIN).clamp(0.0, 1.0);
@@ -1680,7 +1782,7 @@ impl SpotlightView {
             window.request_animation_frame();
         }
         div()
-            .w(px(OPEN_BASE_W))
+            .w(px(base_w))
             .mt(px(fall))
             .child(body)
             .blur(px(blur))
@@ -1760,6 +1862,17 @@ fn section_label(text: &str) -> impl IntoElement {
         .text_xs()
         .text_color(theme::muted())
         .child(text.to_string())
+}
+
+/// A small leading glyph for a Settings sidebar category, by title.
+fn settings_glyph(title: &str) -> &'static str {
+    match title {
+        "General" => "\u{2699}",   // gear
+        "AI" => "\u{2728}",        // sparkles
+        "Jira" => "\u{25c8}",      // diamond-in-square
+        "Clipboard" => "\u{2632}", // trigram (list-ish)
+        _ => "\u{2022}",           // bullet
+    }
 }
 
 /// A Home strip card: a centered icon over an up-to-2-line title, fixed width so
@@ -2166,11 +2279,11 @@ pub fn run(registry: Registry, ui: UiExtensions) {
         // launch. Headless capture is the exception: it needs the window on screen.
         let show_on_launch = std::env::var_os("SPOTLIGHT_CAPTURE").is_some();
 
-        // Window is larger than the 680px resting panel so the animations have
-        // transparent margin to bleed into rather than clipping at the window
-        // edge: width for the open spring's ~1.2× stretch plus blur, and height
-        // for the exit drop. The panel stays centered.
-        let bounds = Bounds::centered(None, size(px(880.), px(720.)), cx);
+        // Window is larger than the widest resting panel (1040px Settings) so the
+        // animations have transparent margin to bleed into rather than clipping at
+        // the window edge, and so the 640px-tall Settings panel (60px top offset)
+        // plus the exit drop fit inside. Panel stays centered.
+        let bounds = Bounds::centered(None, size(px(1160.), px(760.)), cx);
         let window_handle = cx
             .open_window(
                 WindowOptions {

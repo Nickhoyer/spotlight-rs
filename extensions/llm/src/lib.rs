@@ -69,8 +69,8 @@ pub struct Provider {
 
 /// Web-search settings for the agent's `web_search` tool. Backed by a Degoog
 /// meta-search server; defaults to the project's hosted instance so it works out
-/// of the box. There's no Settings UI for this yet — edit the config file (or the
-/// secret store for the key) to change it.
+/// of the box. Editable under the AI settings tab's "Advanced" disclosure (the
+/// optional bearer token lives in the secret store).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
     /// When on, chats advertise a `web_search` tool the model can call for live

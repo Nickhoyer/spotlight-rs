@@ -5,7 +5,7 @@
 use gpui::prelude::*;
 use gpui::{div, Context, Window};
 
-use crate::theme;
+use crate::{controls, theme};
 
 pub struct GeneralSettingsView {
     hotkey: String,
@@ -18,38 +18,31 @@ impl GeneralSettingsView {
         }
     }
 
-    fn row(label: &str, value: String) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .py_2()
-            .child(div().text_color(theme::muted()).child(label.to_string()))
-            .child(div().text_color(theme::text()).child(value))
+    fn value(text: String) -> impl IntoElement {
+        div().text_color(theme::text()).child(text)
     }
 }
 
 impl Render for GeneralSettingsView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let about = div()
+            .flex()
+            .flex_col()
+            .child(controls::settings_row(
+                "Version",
+                "",
+                Self::value(env!("CARGO_PKG_VERSION").to_string()),
+            ))
+            .child(controls::settings_row(
+                "Global hotkey",
+                "Set SPOTLIGHT_HOTKEY to change the summon shortcut.",
+                Self::value(self.hotkey.clone()),
+            ));
+
         div()
             .flex()
             .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_color(theme::text())
-                    .child("Spotlight")
-                    .text_xl()
-                    .pb_2(),
-            )
-            .child(Self::row("Version", env!("CARGO_PKG_VERSION").to_string()))
-            .child(Self::row("Global hotkey", self.hotkey.clone()))
-            .child(
-                div()
-                    .pt_4()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child("Set SPOTLIGHT_HOTKEY to change the summon shortcut."),
-            )
+            .child(div().text_color(theme::text()).child("Spotlight").text_xl().pb_2())
+            .child(controls::section("About", about))
     }
 }

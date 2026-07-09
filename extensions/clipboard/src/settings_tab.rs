@@ -1,13 +1,13 @@
 //! The "Clipboard" settings tab: toggle monitoring and image capture, cap the
-//! history size, and clear everything. Saving persists [`ClipboardConfig`] and
-//! applies the changes to the live store immediately.
+//! history size, and clear everything. Changes apply live — toggles persist and
+//! take effect immediately; the history-size field persists when it loses focus.
 //!
 //! Every control is a focus/tab stop, so the tab is fully keyboard navigable.
 
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{div, px, Context, Entity, FocusHandle, Window};
+use gpui::{div, px, Context, Entity, FocusHandle, Subscription, Window};
 
 use spotlight_config::AppConfig;
 use spotlight_ui::text_input::TextInput;
@@ -24,8 +24,9 @@ pub struct ClipboardSettingsTab {
     enable_focus: FocusHandle,
     images_focus: FocusHandle,
     clear_focus: FocusHandle,
-    save_focus: FocusHandle,
     status: Option<String>,
+    subs: Vec<Subscription>,
+    registered: bool,
 }
 
 impl ClipboardSettingsTab {
@@ -44,12 +45,14 @@ impl ClipboardSettingsTab {
             enable_focus: cx.focus_handle(),
             images_focus: cx.focus_handle(),
             clear_focus: cx.focus_handle(),
-            save_focus: cx.focus_handle(),
             status: None,
+            subs: Vec::new(),
+            registered: false,
         }
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    /// Persist config and apply it to the running store immediately.
+    fn persist(&mut self, cx: &mut Context<Self>) {
         let max_items = self
             .max_items
             .read(cx)
@@ -65,17 +68,11 @@ impl ClipboardSettingsTab {
         };
         let mut app = AppConfig::load();
         let _ = app.set(crate::EXT_ID, &cfg);
-        let saved = app.save();
+        let _ = app.save();
 
-        // Apply to the running store immediately.
         self.store.set_enabled(cfg.enabled);
         self.store.set_capture_images(cfg.capture_images);
         self.store.set_max_items(cfg.max_items);
-
-        self.status = Some(match saved {
-            Ok(()) => "Saved.".to_string(),
-            Err(e) => format!("Couldn't save: {e}"),
-        });
         cx.notify();
     }
 
@@ -85,90 +82,56 @@ impl ClipboardSettingsTab {
         cx.notify();
     }
 
-    /// A labelled On/Off toggle button row.
-    fn toggle_row(
-        label: &str,
-        hint: &str,
-        on: bool,
-        focus: &FocusHandle,
-        cx: &mut Context<Self>,
-        toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .pb_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(div().text_color(theme::text()).child(label.to_string()))
-                    .child(div().text_xs().text_color(theme::muted()).child(hint.to_string())),
-            )
-            .child(controls::button(
-                focus,
-                if on { "On" } else { "Off" },
-                cx,
-                toggle,
-            ))
+    /// Register the blur handler on the history-size field once (needs a `Window`,
+    /// which only `render` provides).
+    fn ensure_blur_subs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registered {
+            return;
+        }
+        self.registered = true;
+        let handle = self.max_items.read(cx).focus_handle().clone();
+        let sub = cx.on_focus_out(&handle, window, |this, _ev, _win, cx| this.persist(cx));
+        self.subs.push(sub);
     }
 }
 
 impl Render for ClipboardSettingsTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_blur_subs(window, cx);
+
         div()
             .id("clipboard-settings")
             .flex()
             .flex_col()
             .size_full()
             .overflow_y_scroll()
-            .child(Self::toggle_row(
+            .child(controls::settings_row(
                 "Monitor clipboard",
                 "Record what you copy into local, encrypted history.",
-                self.enabled,
-                &self.enable_focus,
-                cx,
-                |this, _, cx| {
+                controls::toggle(&self.enable_focus, self.enabled, cx, |this, _, cx| {
                     this.enabled = !this.enabled;
-                    cx.notify();
-                },
+                    this.persist(cx);
+                }),
             ))
-            .child(Self::toggle_row(
+            .child(controls::settings_row(
                 "Capture images",
                 "Also store copied images (they can be large).",
-                self.capture_images,
-                &self.images_focus,
-                cx,
-                |this, _, cx| {
+                controls::toggle(&self.images_focus, self.capture_images, cx, |this, _, cx| {
                     this.capture_images = !this.capture_images;
-                    cx.notify();
-                },
+                    this.persist(cx);
+                }),
             ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .pb_3()
-                    .child(div().text_color(theme::text()).child("History size"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child("Maximum un-pinned items to keep."),
-                    )
-                    .child(div().w(px(120.)).child(self.max_items.clone())),
-            )
+            .child(controls::settings_row(
+                "History size",
+                "Maximum un-pinned items to keep.",
+                div().w(px(120.)).child(self.max_items.clone()),
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_3()
-                    .pt_2()
-                    .child(controls::button(&self.save_focus, "Save", cx, |this, _, cx| {
-                        this.save(cx)
-                    }))
+                    .pt_3()
                     .child(controls::button(&self.clear_focus, "Clear history", cx, |this, _, cx| {
                         this.clear(cx)
                     }))
