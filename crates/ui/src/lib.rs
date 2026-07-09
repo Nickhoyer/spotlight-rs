@@ -1615,6 +1615,11 @@ const PANEL_TOP: f32 = 140.0;
 /// Top offset for the large Settings / extension panels.
 const SETTINGS_TOP: f32 = 60.0;
 
+/// Corner radius of the panel chrome (`chrome`). Shared so edge fades can inset
+/// themselves by it and stay clear of the rounded corners (`overflow_hidden`
+/// clips to the box, not the radius).
+pub(crate) const PANEL_RADIUS: f32 = 24.0;
+
 // --- Per-screen heights, so the panel can animate its height between screens. ---
 /// Settings + extension panels (fixed).
 const PANEL_H: f32 = 640.0;
@@ -1799,7 +1804,7 @@ fn chrome(height: f32, content: AnyElement) -> gpui::Div {
         .w_full()
         .h(px(height))
         .bg(theme::panel_bg())
-        .rounded_3xl()
+        .rounded(px(PANEL_RADIUS))
         .border_1()
         .border_color(theme::border())
         .shadow_lg()

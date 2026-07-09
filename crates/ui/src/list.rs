@@ -102,8 +102,6 @@ fn edge_fade(top: bool) -> impl IntoElement {
     let angle = if top { 0. } else { 180. };
     let base = div()
         .absolute()
-        .left(px(0.))
-        .right(px(0.))
         .h(px(28.))
         .bg(linear_gradient(
             angle,
@@ -111,9 +109,14 @@ fn edge_fade(top: bool) -> impl IntoElement {
             linear_color_stop(theme::panel_opaque(), 1.),
         ));
     if top {
-        base.top(px(0.))
+        base.top(px(0.)).left(px(0.)).right(px(0.))
     } else {
-        base.bottom(px(0.))
+        // The bottom fade sits flush with the panel's rounded bottom edge, and
+        // `overflow_hidden` clips to the box, not the corner radius — so a full-width
+        // strip would paint its opaque end into (and past) the rounded corners. Inset
+        // by the corner radius so the strip lives entirely within the panel's straight
+        // bottom edge, between the two corner arcs, and can never overflow.
+        base.bottom(px(0.)).left(px(crate::PANEL_RADIUS)).right(px(crate::PANEL_RADIUS))
     }
 }
 
