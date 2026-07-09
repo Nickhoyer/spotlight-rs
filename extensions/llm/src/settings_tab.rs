@@ -80,8 +80,11 @@ pub struct LlmSettingsTab {
     search_focus: FocusHandle,
     ambient_focus: FocusHandle,
     web_advanced_focus: FocusHandle,
+    fetch_focus: FocusHandle,
     /// Transient feedback from "Find local" / duplicate presets.
     status: Option<String>,
+    /// Transient feedback from fetching an endpoint's model list (Edit screen).
+    model_status: Option<String>,
     subs: Vec<Subscription>,
     subs_for: Option<usize>,
 }
@@ -145,7 +148,9 @@ impl LlmSettingsTab {
             search_focus: cx.focus_handle(),
             ambient_focus: cx.focus_handle(),
             web_advanced_focus: cx.focus_handle(),
+            fetch_focus: cx.focus_handle(),
             status: None,
+            model_status: None,
             subs: Vec::new(),
             subs_for: None,
         }
@@ -176,14 +181,77 @@ impl LlmSettingsTab {
 
     fn go_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = AiScreen::List;
+        self.model_status = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
     fn go_edit(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_status = None;
         self.screen = AiScreen::Edit(i);
         window.focus(&self.back_focus, cx);
         cx.notify();
+    }
+
+    /// Open a provider's editor and ask its endpoint which models it serves (so
+    /// the picker shows the real list, not a preset's guesses).
+    fn open_provider(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_edit(i, window, cx);
+        let has_url = self
+            .rows
+            .get(i)
+            .map(|r| !r.base_url.read(cx).value().trim().is_empty())
+            .unwrap_or(false);
+        if has_url {
+            self.fetch_models(i, cx);
+        }
+    }
+
+    /// Query `{base_url}/models` and replace the row's offered models with what the
+    /// endpoint actually serves. Leaves the selected model untouched (the user
+    /// picks from the fetched chips).
+    fn fetch_models(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.get(i) else { return };
+        let base_url = row.base_url.read(cx).value().trim().to_string();
+        if base_url.is_empty() {
+            self.model_status = Some("Set a Base URL first.".into());
+            cx.notify();
+            return;
+        }
+        let key = {
+            let k = row.key.read(cx).value().trim().to_string();
+            if k.is_empty() { None } else { Some(k) }
+        };
+        self.model_status = Some("Fetching models\u{2026}".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client::fetch_models(&base_url, key.as_deref()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(models) if !models.is_empty() => {
+                        let focuses: Vec<FocusHandle> = models.iter().map(|_| cx.focus_handle()).collect();
+                        if let Some(row) = this.rows.get_mut(i) {
+                            row.models = models.clone();
+                            row.model_focuses = focuses;
+                        }
+                        this.model_status = Some(format!("{} model(s) available.", models.len()));
+                        this.persist(cx);
+                    }
+                    Ok(_) => {
+                        this.model_status = Some("Endpoint returned no models.".into());
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        this.model_status = Some(format!("Couldn't fetch models: {e}"));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn go_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -613,13 +681,12 @@ impl LlmSettingsTab {
             )
     }
 
-    /// Model picker: chips for the known models, or a free-text field for custom.
+    /// Model picker: an always-editable model id, a "refresh from endpoint" action
+    /// that lists what the endpoint actually serves, and those models as quick-pick
+    /// chips (highlighting the current one).
     fn model_picker(&self, i: usize, row: &ProviderRow, cx: &mut Context<Self>) -> AnyElement {
-        if row.models.is_empty() {
-            return Self::field("Model", &row.model).into_any_element();
-        }
         let current = row.model.read(cx).value().to_string();
-        let mut chips = div().flex().flex_wrap().gap_2();
+        let mut chips = div().flex().flex_wrap().gap_2().pt_1();
         for (m, focus) in row.models.iter().zip(row.model_focuses.iter()) {
             let model = m.clone();
             let selected = current == *m;
@@ -627,12 +694,24 @@ impl LlmSettingsTab {
                 this.set_model(i, model.clone(), cx)
             }));
         }
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(div().text_xs().text_color(theme::muted()).child("Model"))
+            .child(controls::button(&self.fetch_focus, "\u{21bb} Refresh from endpoint", cx, move |this, _, cx| {
+                this.fetch_models(i, cx)
+            }));
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_xs().text_color(theme::muted()).child("Model"))
-            .child(chips)
+            .child(header)
+            .child(row.model.clone())
+            .when(!row.models.is_empty(), |d| d.child(chips))
+            .when_some(self.model_status.clone(), |d, s| {
+                d.child(div().pt_1().text_xs().text_color(theme::muted()).child(s))
+            })
             .into_any_element()
     }
 
@@ -677,7 +756,7 @@ impl LlmSettingsTab {
             Some(trailing),
             is_active,
             cx,
-            move |this, w, cx| this.go_edit(i, w, cx),
+            move |this, w, cx| this.open_provider(i, w, cx),
         )
         .into_any_element()
     }

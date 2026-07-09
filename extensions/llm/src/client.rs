@@ -602,6 +602,30 @@ fn parse_models(resp: ureq::Response) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// List the models a provider's endpoint actually serves (OpenAI-compatible
+/// `GET {base_url}/models`). Used by Settings so the model picker shows what the
+/// endpoint offers rather than a preset's guesses. Blocking; run off the UI thread.
+pub fn fetch_models(base_url: &str, key: Option<&str>) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("no base URL".into());
+    }
+    let url = format!("{base}/models");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(5000))
+        .build();
+    let mut req = agent.get(&url);
+    if let Some(k) = key {
+        if !k.trim().is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", k.trim()));
+        }
+    }
+    match req.call() {
+        Ok(resp) => Ok(parse_models(resp)),
+        Err(e) => Err(describe_ureq(e)),
+    }
+}
+
 /// An API key found on disk for a known local server, so discovery can pre-fill
 /// it. Currently omlx (`~/.omlx/settings.json` \u{2192} `auth.api_key`).
 fn discovered_key(name: &str) -> Option<String> {
@@ -769,6 +793,25 @@ mod tests {
         assert!(!p.local, "auth-required server needs a key field");
         assert!(key.is_none());
         assert!(p.models.is_empty());
+    }
+
+    #[test]
+    fn fetch_models_lists_what_the_endpoint_serves() {
+        let base = serve_once(
+            "200 OK",
+            "{\"data\":[{\"id\":\"MiniCPM5-1B-OptiQ-4bit\"},{\"id\":\"gemma-4-e4b-it-4bit\"}]}",
+        );
+        let models = fetch_models(&base, None).expect("ok");
+        assert_eq!(
+            models,
+            vec!["MiniCPM5-1B-OptiQ-4bit".to_string(), "gemma-4-e4b-it-4bit".to_string()]
+        );
+    }
+
+    #[test]
+    fn fetch_models_surfaces_http_errors() {
+        let base = serve_once("404 Not Found", "{\"error\":\"nope\"}");
+        assert!(fetch_models(&base, None).is_err());
     }
 
     #[test]
