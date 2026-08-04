@@ -1,29 +1,36 @@
-//! Blocking Gmail atom-feed client (Basic auth: address + app password).
+//! Blocking Gmail IMAP client (app-password auth, strictly read-only).
 //!
-//! Gmail exposes unread inbox mail as an atom feed at
-//! `https://mail.google.com/mail/feed/atom`. It accepts a Google app password
-//! (Google account → Security → 2-Step Verification → App passwords), which
-//! sidesteps OAuth entirely. Calls block on the network, so callers run them on
-//! gpui's background executor (see `view.rs`).
+//! The mailbox is opened with EXAMINE rather than SELECT, so nothing we fetch
+//! can ever set `\Seen` (and body fetches use BODY.PEEK[] besides). A Google
+//! app password (Google account → Security → 2-Step Verification → App
+//! passwords) authenticates without OAuth. Calls block on the network, so
+//! callers run them on gpui's background executor (see `view.rs`).
+//!
+//! The session is kept open behind a mutex and lazily reconnected: on any IMAP
+//! error the op is retried once on a fresh connection (Gmail drops idle
+//! sessions after a few minutes).
 
-use std::time::Duration;
+use std::net::TcpStream;
+use std::sync::Mutex;
 
-use anyhow::{bail, Result};
-use base64::Engine as _;
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use anyhow::{anyhow, bail, Result};
+use mail_parser::MessageParser;
 
-use crate::models::{self, Email, Inbox};
+use crate::models::{self, Email, Inbox, MailBody};
 
-const FEED_URL: &str = "https://mail.google.com/mail/feed/atom";
+const HOST: &str = "imap.gmail.com";
+const PORT: u16 = 993;
+/// Newest unread messages shown in the list.
+const MAX_EMAILS: usize = 30;
 /// Where a plain "open my inbox" lands.
 pub const INBOX_URL: &str = "https://mail.google.com/mail/";
 
-#[derive(Clone)]
+type Session = imap::Session<native_tls::TlsStream<TcpStream>>;
+
 pub struct GmailClient {
-    /// Full `Authorization` header value (`Basic <base64>`).
-    auth: String,
-    agent: ureq::Agent,
+    email: String,
+    password: String,
+    session: Mutex<Option<Session>>,
 }
 
 impl GmailClient {
@@ -31,167 +38,139 @@ impl GmailClient {
         // App passwords are displayed with spaces ("abcd efgh ..."); Google
         // accepts them without, so strip whatever form was pasted.
         let password: String = app_password.chars().filter(|c| !c.is_whitespace()).collect();
-        let creds =
-            base64::engine::general_purpose::STANDARD.encode(format!("{}:{password}", email.trim()));
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(20))
-            .build();
         Self {
-            auth: format!("Basic {creds}"),
-            agent,
+            email: email.trim().to_string(),
+            password,
+            session: Mutex::new(None),
         }
     }
 
-    /// Fetch and parse the unread-inbox feed.
+    fn connect(&self) -> Result<Session> {
+        let tls = native_tls::TlsConnector::new()?;
+        let client = imap::connect((HOST, PORT), HOST, &tls)?;
+        let mut session = client.login(&self.email, &self.password).map_err(|(e, _)| {
+            if matches!(&e, imap::error::Error::Parse(_)) {
+                anyhow!("{e}")
+            } else {
+                anyhow!("Gmail rejected the sign-in — check the address and app password")
+            }
+        })?;
+        // EXAMINE = read-only INBOX: fetching mail here can never mark it read.
+        session.examine("INBOX")?;
+        Ok(session)
+    }
+
+    /// Run `op` on the shared session, reconnecting and retrying once if the
+    /// connection has gone stale.
+    fn with_session<T>(&self, op: impl Fn(&mut Session) -> imap::error::Result<T>) -> Result<T> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| anyhow!("Gmail session poisoned"))?;
+        if let Some(session) = guard.as_mut() {
+            match op(session) {
+                Ok(v) => return Ok(v),
+                Err(_) => *guard = None, // stale — fall through to reconnect
+            }
+        }
+        let mut session = self.connect()?;
+        let result = op(&mut session)?;
+        *guard = Some(session);
+        Ok(result)
+    }
+
+    /// Fetch the unread INBOX list: total count plus headers for the newest
+    /// [`MAX_EMAILS`] (no bodies — those come from [`Self::fetch_body`]).
     pub fn fetch_inbox(&self) -> Result<Inbox> {
-        let resp = self
-            .agent
-            .get(FEED_URL)
-            .set("Authorization", &self.auth)
-            .call();
-        match resp {
-            Ok(r) => parse_feed(&r.into_string()?),
-            Err(ureq::Error::Status(401, _)) => {
-                bail!("Gmail rejected the sign-in — check the address and app password")
-            }
-            Err(e) => Err(e.into()),
+        let uids = self.with_session(|s| s.uid_search("UNSEEN"))?;
+        let fullcount = uids.len() as u32;
+
+        let mut uids: Vec<u32> = uids.into_iter().collect();
+        uids.sort_unstable_by(|a, b| b.cmp(a));
+        uids.truncate(MAX_EMAILS);
+        if uids.is_empty() {
+            return Ok(Inbox::default());
         }
+
+        let set = uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches = self.with_session(|s| s.uid_fetch(&set, "(UID RFC822.HEADER)"))?;
+
+        let mut emails: Vec<Email> = fetches
+            .iter()
+            .filter_map(|fetch| {
+                let uid = fetch.uid?;
+                let header = fetch.header()?;
+                Some(email_from_header(uid, header))
+            })
+            .collect();
+        emails.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(Inbox { fullcount, emails })
+    }
+
+    /// Fetch and parse one message's body parts. BODY.PEEK on an EXAMINEd
+    /// mailbox — doubly read-only.
+    pub fn fetch_body(&self, uid: u32) -> Result<MailBody> {
+        let fetches = self.with_session(|s| s.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])"))?;
+        let Some(raw) = fetches.iter().find_map(|f| f.body()) else {
+            bail!("Gmail returned no body for message {uid}");
+        };
+        let Some(message) = MessageParser::default().parse(raw) else {
+            bail!("couldn't parse message {uid}");
+        };
+        // mail-parser synthesizes the missing counterpart (text→html and
+        // html→text), so both are usually present; keep whichever exist.
+        Ok(MailBody {
+            html: message.body_html(0).map(|s| s.into_owned()),
+            text: message.body_text(0).map(|s| s.into_owned()),
+        })
     }
 }
 
-/// Parse the atom feed. Gmail uses Atom 0.3: a `<fullcount>` total plus one
-/// `<entry>` per unread message with `title`/`summary`/`link`/`issued`/`author`.
-pub fn parse_feed(xml: &str) -> Result<Inbox> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut inbox = Inbox::default();
-    let mut entry: Option<Email> = None;
-    let mut in_author = false;
-    // Name of the element whose text content we're inside.
-    let mut current: Option<String> = None;
-
-    loop {
-        match reader.read_event()? {
-            Event::Eof => break,
-            Event::Start(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                match name.as_str() {
-                    "entry" => entry = Some(Email::default()),
-                    "author" => in_author = true,
-                    "link" => read_link(&e, entry.as_mut())?,
-                    _ => {}
-                }
-                current = Some(name);
-            }
-            Event::Empty(e) => {
-                if e.name().as_ref() == b"link" {
-                    read_link(&e, entry.as_mut())?;
-                }
-            }
-            Event::Text(t) => {
-                let text = t.unescape()?.into_owned();
-                let Some(tag) = current.as_deref() else {
-                    continue;
-                };
-                match (&mut entry, tag) {
-                    (None, "fullcount") => inbox.fullcount = text.trim().parse().unwrap_or(0),
-                    (Some(email), "title") => email.subject = text,
-                    (Some(email), "summary") => email.snippet = text,
-                    (Some(email), "id") => email.id = text,
-                    (Some(email), "issued") => {
-                        if let Some((ts, label)) = models::parse_rfc3339(&text) {
-                            email.timestamp = ts;
-                            email.date_label = label;
-                        }
-                    }
-                    (Some(email), "name") if in_author => email.from_name = text,
-                    (Some(email), "email") if in_author => email.from_email = text,
-                    _ => {}
-                }
-            }
-            Event::End(e) => {
-                match e.name().as_ref() {
-                    b"entry" => {
-                        if let Some(email) = entry.take() {
-                            inbox.emails.push(email);
-                        }
-                    }
-                    b"author" => in_author = false,
-                    _ => {}
-                }
-                current = None;
-            }
-            _ => {}
-        }
-    }
-    Ok(inbox)
-}
-
-/// Pull `href` off a `<link .../>` into the current entry's link.
-fn read_link(e: &quick_xml::events::BytesStart, entry: Option<&mut Email>) -> Result<()> {
-    let Some(email) = entry else {
-        return Ok(());
+/// Build a list-row [`Email`] from a raw RFC 822 header block.
+fn email_from_header(uid: u32, header: &[u8]) -> Email {
+    let mut email = Email {
+        uid,
+        ..Default::default()
     };
-    for attr in e.attributes() {
-        let attr = attr?;
-        if attr.key.as_ref() == b"href" {
-            email.link = attr.unescape_value()?.into_owned();
-        }
+    let Some(message) = MessageParser::default().parse(header) else {
+        email.subject = "(unreadable message)".to_string();
+        return email;
+    };
+    email.subject = message.subject().unwrap_or_default().to_string();
+    email.message_id = message.message_id().unwrap_or_default().to_string();
+    if let Some(addr) = message.from().and_then(|a| a.first()) {
+        email.from_name = addr.name().unwrap_or_default().to_string();
+        email.from_email = addr.address().unwrap_or_default().to_string();
     }
-    Ok(())
+    if let Some(date) = message.date() {
+        email.timestamp = date.to_timestamp();
+        email.date_label = models::month_day_label(date.month, date.day);
+    }
+    email
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_feed;
-
-    const SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<feed version="0.3" xmlns="http://purl.org/atom/ns#">
-  <title>Gmail - Inbox for nick@example.com</title>
-  <tagline>New messages in your Gmail Inbox</tagline>
-  <fullcount>2</fullcount>
-  <link rel="alternate" href="https://mail.google.com/mail" type="text/html"/>
-  <modified>2026-08-04T09:30:00Z</modified>
-  <entry>
-    <title>Your invoice &amp; receipt</title>
-    <summary>Thanks for your purchase — here&#39;s the receipt.</summary>
-    <link rel="alternate" href="https://mail.google.com/mail?account_id=nick%40example.com&amp;message_id=18abc&amp;view=conv&amp;extsrc=atom" type="text/html"/>
-    <modified>2026-08-04T09:13:00Z</modified>
-    <issued>2026-08-04T09:13:00Z</issued>
-    <id>tag:gmail.google.com,2004:1234567890</id>
-    <author><name>Acme Billing</name><email>billing@acme.com</email></author>
-  </entry>
-  <entry>
-    <title></title>
-    <summary>No subject here</summary>
-    <link rel="alternate" href="https://mail.google.com/mail?message_id=18def" type="text/html"/>
-    <issued>2026-08-03T20:00:00Z</issued>
-    <id>tag:gmail.google.com,2004:987</id>
-    <author><name>Someone</name><email>s@example.com</email></author>
-  </entry>
-</feed>"#;
+    use super::email_from_header;
 
     #[test]
-    fn parses_gmail_feed() {
-        let inbox = parse_feed(SAMPLE).unwrap();
-        assert_eq!(inbox.fullcount, 2);
-        assert_eq!(inbox.emails.len(), 2);
-
-        let first = &inbox.emails[0];
-        assert_eq!(first.subject, "Your invoice & receipt");
-        assert_eq!(first.snippet, "Thanks for your purchase — here's the receipt.");
-        assert_eq!(first.from_name, "Acme Billing");
-        assert_eq!(first.from_email, "billing@acme.com");
-        assert_eq!(first.id, "tag:gmail.google.com,2004:1234567890");
-        // Entity-encoded ampersands in the href must come back decoded.
-        assert!(first.link.contains("message_id=18abc&view=conv"));
-        assert!(first.timestamp > 0);
-        assert_eq!(first.date_label, "Aug 4");
-
-        // The feed-level <title>/<link> must not bleed into entries.
-        let second = &inbox.emails[1];
-        assert_eq!(second.subject, "");
-        assert_eq!(second.from_name, "Someone");
+    fn parses_header_block() {
+        let header = b"From: \"Acme Billing\" <billing@acme.com>\r\n\
+Subject: =?utf-8?Q?Your_invoice_=E2=80=94_ready?=\r\n\
+Date: Tue, 4 Aug 2026 09:13:00 +0000\r\n\
+Message-ID: <abc123@mail.acme.com>\r\n\
+\r\n";
+        let email = email_from_header(7, header);
+        assert_eq!(email.uid, 7);
+        assert_eq!(email.subject, "Your invoice — ready");
+        assert_eq!(email.from_name, "Acme Billing");
+        assert_eq!(email.from_email, "billing@acme.com");
+        assert_eq!(email.message_id, "abc123@mail.acme.com");
+        assert!(email.timestamp > 0);
+        assert_eq!(email.date_label, "Aug 4");
     }
 }

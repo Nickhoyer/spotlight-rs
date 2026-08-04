@@ -42,10 +42,21 @@ serde_json = "1"
 # background executor. `json` pulls in serde_json round-tripping; default
 # features include rustls TLS for https://*.atlassian.net.
 ureq = { version = "2", features = ["json"] }
-# Basic-auth header encoding for the Jira API and the Gmail atom feed.
+# Basic-auth header encoding for the Jira API.
 base64 = "0.22"
-# Streaming XML parser for Gmail's atom inbox feed.
-quick-xml = "0.37"
+# IMAP + MIME parsing for the Gmail extension (app-password auth, read-only).
+imap = "2"
+native-tls = "0.2"
+mail-parser = "0.11"
+# Headless HTML/CSS renderer (Servo's Stylo + CPU Vello) for HTML email bodies.
+anyrender = "0.11"
+anyrender_vello_cpu = "0.14"
+blitz-dom = "=0.3.0-beta.1"
+blitz-html = "=0.3.0-beta.1"
+blitz-paint = "=0.3.0-beta.1"
+blitz-traits = "=0.3.0-beta.1"
+# Must match gpui's image version (RenderImage frames are image::Frame).
+image = { version = "0.25", default-features = false }
 # macOS Keychain storage for the Jira API token in release builds.
 security-framework = "2"
 
@@ -60,6 +71,13 @@ ext-clipboard = { path = "extensions/clipboard" }
 ext-gmail = { path = "extensions/gmail" }
 ext-jira = { path = "extensions/jira" }
 ext-llm = { path = "extensions/llm" }
+
+# stylo's ToCss derive emits untyped `Ok(())?` whose error-type inference
+# breaks when anything else in the graph impls `From<..> for fmt::Error`
+# (gpui → zed log kv features → serde_fmt does). Vendored one-line fix; see
+# third_party/stylo_derive/PATCH-NOTE.md.
+[patch.crates-io]
+stylo_derive = { path = "third_party/stylo_derive" }
 
 [profile.dev]
 # GPUI is heavy; a little optimization on deps keeps dev runs smooth without

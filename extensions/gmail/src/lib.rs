@@ -1,13 +1,17 @@
-//! Gmail extension: a panel showing unread inbox mail via Gmail's atom feed,
-//! authenticated with a Google app password (no OAuth dance).
+//! Gmail extension: a panel showing unread inbox mail over IMAP, authenticated
+//! with a Google app password (no OAuth dance), with in-app reading — HTML
+//! bodies render via Blitz, text/plain as fallback.
 //!
 //! It plugs into the shell as a [`PanelEntry`] (Home shortcut + screen) and a
 //! [`SettingsTabFactory`] (a "Gmail" tab). `app` registers both.
 
 mod client;
+mod htmlview;
 mod models;
 mod settings_tab;
 mod view;
+
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -53,14 +57,26 @@ pub fn load_config() -> GmailConfig {
     AppConfig::load().get::<GmailConfig>(EXT_ID).unwrap_or_default()
 }
 
-/// Build a client from settings + stored app password, or `None` if not
-/// configured yet.
-pub fn build_client(cfg: &GmailConfig) -> Option<GmailClient> {
+/// Build (or reuse) a client from settings + stored app password, or `None` if
+/// not configured yet. The client is process-global so its IMAP session
+/// survives panel re-opens; changing the address or password swaps it out.
+pub fn build_client(cfg: &GmailConfig) -> Option<Arc<GmailClient>> {
+    static SHARED: OnceLock<Mutex<Option<(String, Arc<GmailClient>)>>> = OnceLock::new();
+
     let password = spotlight_config::load_secret(PASSWORD_KEY)?;
     if cfg.email.trim().is_empty() || password.trim().is_empty() {
         return None;
     }
-    Some(GmailClient::new(&cfg.email, &password))
+    let key = format!("{}\u{0}{}", cfg.email.trim(), password);
+    let mut guard = SHARED.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if let Some((cached_key, client)) = guard.as_ref() {
+        if *cached_key == key {
+            return Some(client.clone());
+        }
+    }
+    let client = Arc::new(GmailClient::new(&cfg.email, &password));
+    *guard = Some((key, client.clone()));
+    Some(client)
 }
 
 fn cache_path() -> std::path::PathBuf {
