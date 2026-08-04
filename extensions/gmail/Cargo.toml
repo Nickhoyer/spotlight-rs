@@ -1,0 +1,16 @@
+[package]
+name = "ext-gmail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+base64.workspace = true
+quick-xml.workspace = true
+spotlight-config.workspace = true
+spotlight-ui.workspace = true

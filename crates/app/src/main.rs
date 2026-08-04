@@ -43,11 +43,13 @@ fn main() {
     let ui = UiExtensions {
         panels: vec![
             ext_jira::panel_entry(),
+            ext_gmail::panel_entry(),
             clipboard.panel_entry(),
             ext_llm::panel_entry(),
         ],
         settings_tabs: vec![
             ext_jira::settings_tab(),
+            ext_gmail::settings_tab(),
             clipboard.settings_tab(),
             ext_llm::settings_tab(),
         ],

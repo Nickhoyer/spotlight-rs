@@ -9,6 +9,7 @@ members = [
     "extensions/apps",
     "extensions/calculator",
     "extensions/clipboard",
+    "extensions/gmail",
     "extensions/jira",
     "extensions/llm",
 ]
@@ -41,8 +42,10 @@ serde_json = "1"
 # background executor. `json` pulls in serde_json round-tripping; default
 # features include rustls TLS for https://*.atlassian.net.
 ureq = { version = "2", features = ["json"] }
-# Basic-auth header encoding for the Jira API.
+# Basic-auth header encoding for the Jira API and the Gmail atom feed.
 base64 = "0.22"
+# Streaming XML parser for Gmail's atom inbox feed.
+quick-xml = "0.37"
 # macOS Keychain storage for the Jira API token in release builds.
 security-framework = "2"
 
@@ -54,6 +57,7 @@ spotlight-ui = { path = "crates/ui" }
 ext-apps = { path = "extensions/apps" }
 ext-calculator = { path = "extensions/calculator" }
 ext-clipboard = { path = "extensions/clipboard" }
+ext-gmail = { path = "extensions/gmail" }
 ext-jira = { path = "extensions/jira" }
 ext-llm = { path = "extensions/llm" }
 
