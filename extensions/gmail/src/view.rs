@@ -11,7 +11,6 @@ use gpui::{
     MouseButton, Window,
 };
 
-use spotlight_config::{AppConfig, Recent};
 use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
@@ -101,23 +100,6 @@ impl GmailView {
             email.link.clone()
         };
         open_url(&url);
-        // Record the use so the message shows up in Home recents.
-        let mut cfg = AppConfig::load();
-        cfg.record_use(Recent {
-            id: format!("gmail:{}", email.id),
-            title: if email.subject.is_empty() {
-                "(no subject)".to_string()
-            } else {
-                email.subject.clone()
-            },
-            subtitle: Some(format!("Mail from {}", email.sender())),
-            url: Some(url),
-            path: None,
-            icon: None,
-            glyph: Some("✉️".to_string()),
-            panel: None,
-        });
-        let _ = cfg.save();
     }
 
     // ---- keyboard ---------------------------------------------------------

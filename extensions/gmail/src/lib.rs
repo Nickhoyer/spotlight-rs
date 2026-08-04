@@ -24,6 +24,23 @@ pub const EXT_ID: &str = "gmail";
 /// Secret-store key for the app password.
 pub const PASSWORD_KEY: &str = "gmail-app-password";
 
+/// The Gmail logo (Wikimedia's 2020 icon, rasterized on a square canvas),
+/// embedded and written to disk so the shortcut tile can reference it by path.
+const ICON_PNG: &[u8] = include_bytes!("../assets/gmail.png");
+
+/// Path to the on-disk Gmail icon, materializing it from the embedded bytes on
+/// first call.
+pub fn icon_path() -> String {
+    let path = spotlight_config::config_dir().join("assets").join("gmail.png");
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, ICON_PNG);
+    }
+    path.to_string_lossy().into_owned()
+}
+
 /// Persisted Gmail settings (the app password lives in the secret store).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GmailConfig {
@@ -72,7 +89,7 @@ pub fn panel_entry() -> PanelEntry {
         id: EXT_ID.to_string(),
         title: "Gmail".to_string(),
         glyph: "✉️".to_string(),
-        icon: None,
+        icon: Some(icon_path()),
         make_view: Box::new(|cx, _seed| cx.new(GmailView::new).into()),
     }
 }
