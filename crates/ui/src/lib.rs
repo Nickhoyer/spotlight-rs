@@ -1609,6 +1609,13 @@ const OPEN_BASE_W: f32 = 680.0;
 /// Resting panel width for Settings + extension panels — wider than Home so a
 /// proper settings layout fits. The width eases between screens (like height).
 const SETTINGS_W: f32 = 1040.0;
+
+/// The resting width extension panels are laid out at, for panels that need to
+/// size fixed-width content (e.g. Gmail renders email HTML to an image sized
+/// to fill the pane).
+pub fn extension_panel_width() -> f32 {
+    SETTINGS_W
+}
 /// Top offset for the search-shaped screens (Home/Search). Settings uses a
 /// smaller offset (`SETTINGS_TOP`) so its large panel sits higher / more centered.
 const PANEL_TOP: f32 = 140.0;

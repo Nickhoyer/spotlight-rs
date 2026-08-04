@@ -24,8 +24,12 @@ use crate::client::{GmailClient, INBOX_URL};
 use crate::htmlview::{self, HitTester};
 use crate::models::{self, Email, Inbox, MailBody};
 
-/// Logical width the email body is rendered at (typical email design width).
-const READ_WIDTH: u32 = 640;
+/// Logical width the email body renders at: the panel's content width (the
+/// panel is fixed-width; a small margin keeps the card off the panel edges).
+fn read_width() -> f32 {
+    spotlight_ui::extension_panel_width() - 32.0
+}
+
 /// Arrow-key scroll step in the reading pane.
 const SCROLL_STEP: f32 = 80.0;
 
@@ -91,9 +95,10 @@ pub struct GmailView {
     body_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Whether we've taken focus once (so we focus on first render only).
     focused_once: bool,
-    /// Debug aid: HTML to open in the reading pane on first render
-    /// (`SPOTLIGHT_GMAIL_DEMO_HTML=<path>`), for headless captures.
-    demo_html: Option<String>,
+    /// Debug aid: body to open in the reading pane on first render
+    /// (`SPOTLIGHT_GMAIL_DEMO_HTML=<path>`; a `.txt` path exercises the
+    /// text/plain fallback), for headless captures.
+    demo_body: Option<MailBody>,
 }
 
 impl GmailView {
@@ -114,9 +119,20 @@ impl GmailView {
             read_scroll: ScrollHandle::new(),
             body_bounds: Rc::new(Cell::new(Bounds::default())),
             focused_once: false,
-            demo_html: std::env::var("SPOTLIGHT_GMAIL_DEMO_HTML")
-                .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok()),
+            demo_body: std::env::var("SPOTLIGHT_GMAIL_DEMO_HTML").ok().and_then(|path| {
+                let content = std::fs::read_to_string(&path).ok()?;
+                Some(if path.ends_with(".txt") {
+                    MailBody {
+                        html: None,
+                        text: Some(content),
+                    }
+                } else {
+                    MailBody {
+                        html: Some(content),
+                        text: None,
+                    }
+                })
+            }),
         };
 
         if view.client.is_none() {
@@ -284,10 +300,11 @@ impl GmailView {
         }
         let text_fallback = body.text.clone();
         if let Some(html) = body.html {
+            let width = read_width() as u32;
             cx.spawn(async move |this, cx| {
                 let rendered = cx
                     .background_executor()
-                    .spawn(async move { htmlview::render_email(&html, READ_WIDTH, scale) })
+                    .spawn(async move { htmlview::render_email(&html, width, scale) })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let state = match rendered {
@@ -566,7 +583,7 @@ impl GmailView {
             ReadState::Failed(msg) => centered(msg),
             ReadState::Text(text) => {
                 let mut column = div()
-                    .w(px(READ_WIDTH as f32))
+                    .w(px(read_width()))
                     .flex()
                     .flex_col()
                     .py_4()
@@ -655,22 +672,15 @@ impl Render for GmailView {
             window.focus(&self.focus_handle, cx);
             self.focused_once = true;
         }
-        // Debug aid: drop straight into the reading pane with a file's HTML.
-        if let Some(html) = self.demo_html.take() {
+        // Debug aid: drop straight into the reading pane with a file's body.
+        if let Some(body) = self.demo_body.take() {
             let email = self.inbox.emails.first().cloned().unwrap_or_else(|| Email {
                 uid: 1,
                 subject: "Demo message".to_string(),
                 from_name: "Demo".to_string(),
                 ..Default::default()
             });
-            store_body(
-                &self.account,
-                email.uid,
-                MailBody {
-                    html: Some(html),
-                    text: None,
-                },
-            );
+            store_body(&self.account, email.uid, body);
             self.open_reading(email, window, cx);
         }
 
