@@ -257,6 +257,10 @@ impl GmailView {
         }
         let uid = email.uid;
         let scale = window.scale_factor() as f64;
+        crate::debug_log(&format!(
+            "open uid={uid} cached={} scale={scale}",
+            cached_body(&self.account, uid).is_some()
+        ));
         self.read_scroll.set_offset(Point::default());
         self.reading = Some(Reading {
             email: email.clone(),
@@ -280,6 +284,7 @@ impl GmailView {
                         this.present_body(uid, body, scale, cx);
                     }
                     Err(e) => {
+                        crate::debug_log(&format!("fetch uid={uid}: FAILED: {e}"));
                         this.set_read_state(uid, ReadState::Failed(format!("Couldn't load message: {e}")));
                         cx.notify();
                     }
@@ -319,18 +324,26 @@ impl GmailView {
                                     logical_w: r.logical_width,
                                     logical_h: r.logical_height,
                                 },
-                                None => text_or_failed(text_fallback),
+                                None => {
+                                    crate::debug_log(&format!(
+                                        "present uid={uid}: buffer size mismatch, falling back"
+                                    ));
+                                    text_or_failed(text_fallback)
+                                }
                             }
                         }
                         Err(_) => text_or_failed(text_fallback),
                     };
+                    crate::debug_log(&format!("state uid={uid} -> {}", state_name(&state)));
                     this.set_read_state(uid, state);
                     cx.notify();
                 });
             })
             .detach();
         } else {
-            self.set_read_state(uid, text_or_failed(text_fallback));
+            let state = text_or_failed(text_fallback);
+            crate::debug_log(&format!("state uid={uid} (no html) -> {}", state_name(&state)));
+            self.set_read_state(uid, state);
         }
         cx.notify();
     }
@@ -749,6 +762,15 @@ impl Render for GmailView {
 fn fill_snippet(email: &mut Email, body: &MailBody) {
     if let Some(text) = &body.text {
         email.snippet = models::snippet_of(text);
+    }
+}
+
+fn state_name(state: &ReadState) -> String {
+    match state {
+        ReadState::Loading => "Loading".to_string(),
+        ReadState::Html { logical_w, logical_h, .. } => format!("Html({logical_w}x{logical_h})"),
+        ReadState::Text(t) => format!("Text({}B)", t.len()),
+        ReadState::Failed(msg) => format!("Failed({msg})"),
     }
 }
 

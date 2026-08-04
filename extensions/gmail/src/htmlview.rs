@@ -90,6 +90,11 @@ pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<(Rende
     std::thread::Builder::new()
         .name("gmail-htmlview".to_string())
         .spawn(move || {
+            crate::debug_log(&format!(
+                "render: start {}B html at {logical_width}px @{scale}x",
+                html.len()
+            ));
+            let started = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 build_and_render(&html, logical_width, scale)
             }))
@@ -101,6 +106,20 @@ pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<(Rende
                     .unwrap_or("renderer panicked");
                 Err(anyhow!("HTML renderer failed: {msg}"))
             });
+            match &outcome {
+                Ok((_, r, _)) => crate::debug_log(&format!(
+                    "render: ok {}x{} physical ({}x{} logical) in {}ms",
+                    r.width,
+                    r.height,
+                    r.logical_width,
+                    r.logical_height,
+                    started.elapsed().as_millis()
+                )),
+                Err(e) => crate::debug_log(&format!(
+                    "render: FAILED after {}ms: {e}",
+                    started.elapsed().as_millis()
+                )),
+            }
             match outcome {
                 Ok((mut document, rendered, boxes)) => {
                     if result_tx.send(Ok(rendered)).is_err() {

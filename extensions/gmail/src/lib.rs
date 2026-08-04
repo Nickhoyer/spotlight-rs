@@ -85,6 +85,25 @@ fn cache_path() -> std::path::PathBuf {
     spotlight_config::cache_dir().join("gmail-inbox.json")
 }
 
+/// Append a diagnostic line to `<cache>/gmail-debug.log` (and stderr, for
+/// terminal runs). Deliberately cheap and always on: a handful of lines per
+/// message open, no message content — uids, part sizes, dimensions, errors.
+pub(crate) fn debug_log(msg: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m, s) = ((now / 3600) % 24, (now / 60) % 60, now % 60);
+    let line = format!("[{h:02}:{m:02}:{s:02}Z] {msg}\n");
+    eprint!("gmail: {line}");
+    let path = spotlight_config::cache_dir().join("gmail-debug.log");
+    let _ = std::fs::create_dir_all(spotlight_config::cache_dir());
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Load the cached inbox (empty on miss/corruption).
 pub fn load_cache() -> Inbox {
     std::fs::read_to_string(cache_path())
