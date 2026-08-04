@@ -32,11 +32,13 @@ pub const PASSWORD_KEY: &str = "gmail-app-password";
 /// embedded and written to disk so the shortcut tile can reference it by path.
 const ICON_PNG: &[u8] = include_bytes!("../assets/gmail.png");
 
-/// Path to the on-disk Gmail icon, materializing it from the embedded bytes on
-/// first call.
+/// Path to the on-disk Gmail icon, materializing it from the embedded bytes.
+/// Rewritten whenever the on-disk copy differs (not just when missing), so
+/// icon updates actually reach configs that materialized an older version.
 pub fn icon_path() -> String {
     let path = spotlight_config::config_dir().join("assets").join("gmail.png");
-    if !path.exists() {
+    let stale = std::fs::read(&path).map(|b| b != ICON_PNG).unwrap_or(true);
+    if stale {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }

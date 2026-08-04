@@ -114,6 +114,105 @@ pub fn snippet_of(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Crude but dependable HTML→text conversion for the reading fallback when a
+/// message has no text/plain part (and its HTML can't be or isn't rendered):
+/// drops tags (and `<style>`/`<script>` contents), decodes the common
+/// entities, and breaks lines at block-level closers.
+pub fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut chars = html.char_indices().peekable();
+    let mut skip_until: Option<&str> = None;
+    while let Some((i, c)) = chars.next() {
+        let rest = &html[i..];
+        if let Some(closer) = skip_until {
+            if rest.len() >= closer.len() && rest[..closer.len()].eq_ignore_ascii_case(closer) {
+                skip_until = None;
+                // Consume the rest of the closer tag too.
+                for _ in 0..closer.len() - 1 {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        match c {
+            '<' => {
+                let lower = rest.get(..7).unwrap_or("").to_ascii_lowercase();
+                if lower.starts_with("<style") {
+                    skip_until = Some("</style>");
+                } else if lower.starts_with("<script") {
+                    skip_until = Some("</script>");
+                }
+                // Break lines at block-ish boundaries, and keep table cells
+                // from running together.
+                if lower.starts_with("<br") || lower.starts_with("</p") || lower.starts_with("</div")
+                    || lower.starts_with("</tr") || lower.starts_with("</h") || lower.starts_with("</li")
+                {
+                    out.push('\n');
+                } else if lower.starts_with("</td") || lower.starts_with("</th") {
+                    out.push(' ');
+                }
+                // Skip to the end of the tag.
+                for (_, tc) in chars.by_ref() {
+                    if tc == '>' {
+                        break;
+                    }
+                }
+            }
+            '&' => match decode_entity(rest) {
+                Some((len, decoded)) => {
+                    out.push(decoded);
+                    for _ in 0..len - 1 {
+                        chars.next();
+                    }
+                }
+                None => out.push('&'),
+            },
+            _ => out.push(c),
+        }
+    }
+    // Collapse the whitespace soup HTML leaves behind: spaces within lines,
+    // runs of blank lines between them.
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            if !lines.last().map(String::is_empty).unwrap_or(true) {
+                lines.push(String::new());
+            }
+        } else {
+            lines.push(line);
+        }
+    }
+    while lines.last().map(String::is_empty).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Decode one HTML entity at the start of `s`: `(byte_len, char)`. Handles the
+/// named entities emails actually use plus numeric (`&#8212;` / `&#x2014;`).
+fn decode_entity(s: &str) -> Option<(usize, char)> {
+    const NAMED: &[(&str, char)] = &[
+        ("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>'), ("&quot;", '"'),
+        ("&apos;", '\''), ("&nbsp;", ' '), ("&mdash;", '—'), ("&ndash;", '–'),
+        ("&lsquo;", '\u{2018}'), ("&rsquo;", '\u{2019}'), ("&ldquo;", '“'),
+        ("&rdquo;", '”'), ("&hellip;", '…'), ("&copy;", '©'), ("&reg;", '®'),
+        ("&trade;", '™'), ("&middot;", '·'), ("&bull;", '•'),
+    ];
+    if let Some((name, ch)) = NAMED.iter().find(|(name, _)| s.starts_with(name)) {
+        return Some((name.len(), *ch));
+    }
+    // Numeric: &#8212; or &#x2014; (bounded so a stray '&#' can't run away).
+    let body = s.strip_prefix("&#")?;
+    let end = body.char_indices().take(8).find(|(_, c)| *c == ';')?.0;
+    let digits = &body[..end];
+    let value = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse().ok()?,
+    };
+    Some((2 + end + 1, char::from_u32(value)?))
+}
+
 /// Minimal RFC 3986 percent-encoding (unreserved characters pass through).
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -168,6 +267,20 @@ mod tests {
         assert_eq!(snippet_of("  Hi\n\n  there\tworld  "), "Hi there world");
         let long = "x".repeat(400);
         assert!(snippet_of(&long).len() <= 151);
+    }
+
+    #[test]
+    fn strips_html_to_readable_text() {
+        let html = r#"<html><head><style>body { color: red; }</style></head>
+<body><div>Hi Nick,</div><p>Invoice <b>#4821</b> &amp; receipt &mdash; total <span>$29.00</span></p>
+<script>tracking();</script>
+<table><tr><td>Total</td><td>$29.00</td></tr></table></body></html>"#;
+        let text = strip_html(html);
+        assert!(text.contains("Hi Nick,"), "got: {text:?}");
+        assert!(text.contains("Invoice #4821 & receipt — total"), "got: {text:?}");
+        assert!(text.contains("Total $29.00"), "got: {text:?}");
+        assert!(!text.contains("color"), "style leaked: {text:?}");
+        assert!(!text.contains("tracking"), "script leaked: {text:?}");
     }
 
     #[test]

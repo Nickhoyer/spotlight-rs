@@ -19,9 +19,11 @@ use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::shell::{ColorScheme, Viewport};
 
-/// Cap on rendered document height (logical px) — keeps one pathological
-/// newsletter from allocating a gigapixel buffer. Anything longer is clipped.
-const MAX_HEIGHT: f64 = 12_000.0;
+/// Cap on rendered document height in *physical* px. Metal refuses textures
+/// above 16384px, and gpui uploads the image as one texture — anything taller
+/// displays as nothing at all. Kept well under the limit; it also bounds CPU
+/// paint time for pathological newsletters. Anything longer is clipped.
+const MAX_PHYSICAL_HEIGHT: f64 = 12_000.0;
 
 /// Base URL for resolving the relative / protocol-relative URLs that real
 /// emails are full of (`//fonts.googleapis.com/...`, `cid:` images, bare
@@ -149,7 +151,7 @@ fn build_and_render(
     document.as_mut().resolve(0.0);
 
     let content_height = document.as_ref().root_element().final_layout.size.height;
-    let logical_height = (content_height as f64).clamp(24.0, MAX_HEIGHT);
+    let logical_height = (content_height as f64).clamp(24.0, MAX_PHYSICAL_HEIGHT / scale);
     let width = (logical_width as f64 * scale) as u32;
     let height = (logical_height * scale) as u32;
     if width == 0 || height == 0 {

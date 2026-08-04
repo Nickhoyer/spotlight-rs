@@ -118,16 +118,24 @@ impl GmailClient {
         let Some(raw) = fetches.iter().find_map(|f| f.body()) else {
             bail!("Gmail returned no body for message {uid}");
         };
-        let Some(message) = MessageParser::default().parse(raw) else {
-            bail!("couldn't parse message {uid}");
-        };
-        // mail-parser synthesizes the missing counterpart (text→html and
-        // html→text), so both are usually present; keep whichever exist.
-        Ok(MailBody {
-            html: message.body_html(0).map(|s| s.into_owned()),
-            text: message.body_text(0).map(|s| s.into_owned()),
-        })
+        body_from_raw(raw, uid)
     }
+}
+
+/// Parse a raw RFC 822 message into body parts. The reading pane's text
+/// fallback must always have something to show, so when a message carries no
+/// usable text/plain part one is synthesized by stripping the HTML.
+fn body_from_raw(raw: &[u8], uid: u32) -> Result<MailBody> {
+    let Some(message) = MessageParser::default().parse(raw) else {
+        bail!("couldn't parse message {uid}");
+    };
+    let html = message.body_html(0).map(|s| s.into_owned());
+    let text = message
+        .body_text(0)
+        .map(|s| s.into_owned())
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| html.as_deref().map(models::strip_html));
+    Ok(MailBody { html, text })
 }
 
 /// Build a list-row [`Email`] from a raw RFC 822 header block.
@@ -155,7 +163,21 @@ fn email_from_header(uid: u32, header: &[u8]) -> Email {
 
 #[cfg(test)]
 mod tests {
-    use super::email_from_header;
+    use super::{body_from_raw, email_from_header};
+
+    #[test]
+    fn html_only_messages_get_synthesized_text() {
+        let raw = b"From: a@b.com\r\n\
+Subject: hi\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<html><body><p>Hello <b>world</b> &amp; friends</p></body></html>\r\n";
+        let body = body_from_raw(raw, 1).unwrap();
+        assert!(body.html.is_some());
+        let text = body.text.expect("text synthesized from html");
+        assert!(text.contains("Hello world & friends"), "got: {text:?}");
+    }
 
     #[test]
     fn parses_header_block() {
