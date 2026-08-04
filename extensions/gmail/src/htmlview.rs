@@ -2,13 +2,16 @@
 //! Taffy layout + CPU Vello painting). No JavaScript, and no network provider
 //! is configured, so remote images and trackers are never fetched.
 //!
-//! `render_email` is pure computation returning only `Send` data (pixels +
-//! link rects), so it can run on gpui's background executor; the `HtmlDocument`
-//! itself never leaves the call. Link rects are extracted up front (absolute
-//! CSS-pixel boxes for every `<a href>`) because the document isn't kept
-//! around for click-time hit-testing.
+//! The document itself is `!Send`, so each render runs on its own named
+//! thread, which then stays alive serving click→link hit-tests over a channel
+//! (glyph-exact for inline links, precomputed boxes for padded buttons) until
+//! the [`HitTester`] is dropped. Everything crossing back is plain `Send`
+//! data: pixels, dimensions, hrefs.
 
-use anyhow::{bail, Result};
+use std::sync::mpsc::{channel, Sender};
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Result};
 use anyrender::render_to_buffer;
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::{local_name, BaseDocument, DocumentConfig};
@@ -20,24 +23,31 @@ use blitz_traits::shell::{ColorScheme, Viewport};
 /// newsletter from allocating a gigapixel buffer. Anything longer is clipped.
 const MAX_HEIGHT: f64 = 12_000.0;
 
+/// Base URL for resolving the relative / protocol-relative URLs that real
+/// emails are full of (`//fonts.googleapis.com/...`, `cid:` images, bare
+/// paths). Without one, blitz's `resolve_url` panics on the first such href.
+/// Nothing is ever fetched — there is no net provider — resolution just must
+/// not fail.
+const BASE_URL: &str = "https://mail.google.com/";
+
 /// An absolute link box in logical (CSS-pixel) document coordinates.
 #[derive(Debug, Clone)]
-pub struct LinkBox {
-    pub x0: f32,
-    pub y0: f32,
-    pub x1: f32,
-    pub y1: f32,
-    pub href: String,
+struct LinkBox {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    href: String,
 }
 
 impl LinkBox {
-    pub fn contains(&self, x: f32, y: f32) -> bool {
+    fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
 }
 
 /// A rendered email body: straight-alpha BGRA pixels (gpui's `RenderImage`
-/// byte order) plus clickable link boxes.
+/// byte order) plus the layout size to present them at.
 pub struct RenderedEmail {
     /// Physical pixel dimensions of `bgra`.
     pub width: u32,
@@ -46,12 +56,77 @@ pub struct RenderedEmail {
     pub logical_width: f32,
     pub logical_height: f32,
     pub bgra: Vec<u8>,
-    pub links: Vec<LinkBox>,
+}
+
+/// Handle to the render thread's document for click→link resolution. Dropping
+/// it lets the thread exit.
+pub struct HitTester {
+    query: Sender<(f32, f32, Sender<Option<String>>)>,
+}
+
+impl HitTester {
+    /// The href under logical document coordinates `(x, y)`, if any.
+    pub fn hit(&self, x: f32, y: f32) -> Option<String> {
+        let (reply_tx, reply_rx) = channel();
+        self.query.send((x, y, reply_tx)).ok()?;
+        reply_rx.recv_timeout(Duration::from_millis(100)).ok()?
+    }
 }
 
 /// Render an HTML email body at `logical_width` CSS px wide, rasterized at
-/// `scale`× for the screen. Emails assume a white canvas, so one is injected.
-pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<RenderedEmail> {
+/// `scale`× for the screen. Blocks until the first paint completes (callers
+/// run it on the background executor).
+///
+/// Blitz is young and panics on some malformed documents; panics on the
+/// render thread degrade to an error (→ the caller's text fallback) rather
+/// than poisoning the app.
+pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<(RenderedEmail, HitTester)> {
+    let (result_tx, result_rx) = channel();
+    let (query_tx, query_rx) = channel::<(f32, f32, Sender<Option<String>>)>();
+    let html = html.to_string();
+
+    std::thread::Builder::new()
+        .name("gmail-htmlview".to_string())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_and_render(&html, logical_width, scale)
+            }))
+            .unwrap_or_else(|payload| {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("renderer panicked");
+                Err(anyhow!("HTML renderer failed: {msg}"))
+            });
+            match outcome {
+                Ok((mut document, rendered, boxes)) => {
+                    if result_tx.send(Ok(rendered)).is_err() {
+                        return;
+                    }
+                    // Serve hit-tests until the HitTester is dropped.
+                    while let Ok((x, y, reply)) = query_rx.recv() {
+                        let href = hit_href(document.as_mut(), x, y, scale, &boxes);
+                        let _ = reply.send(href);
+                    }
+                }
+                Err(e) => {
+                    let _ = result_tx.send(Err(e));
+                }
+            }
+        })?;
+
+    let rendered = result_rx
+        .recv()
+        .map_err(|_| anyhow!("HTML renderer thread died"))??;
+    Ok((rendered, HitTester { query: query_tx }))
+}
+
+fn build_and_render(
+    html: &str,
+    logical_width: u32,
+    scale: f64,
+) -> Result<(HtmlDocument, RenderedEmail, Vec<LinkBox>)> {
     // Emails render on white regardless of app theme; inject a base style
     // (author styles still override backgrounds).
     let html = format!(
@@ -61,6 +136,7 @@ pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<Render
     let mut document = HtmlDocument::from_html(
         &html,
         DocumentConfig {
+            base_url: Some(BASE_URL.to_string()),
             viewport: Some(Viewport::new(
                 logical_width * (scale as u32),
                 800 * (scale as u32),
@@ -90,18 +166,40 @@ pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<Render
         pixel.swap(0, 2);
     }
 
-    let links = collect_links(document.as_ref());
-    Ok(RenderedEmail {
+    let boxes = collect_links(document.as_ref());
+    let rendered = RenderedEmail {
         width,
         height,
         logical_width: logical_width as f32,
         logical_height: logical_height as f32,
         bgra,
-        links,
-    })
+    };
+    Ok((document, rendered, boxes))
 }
 
-/// Absolute boxes for every `<a href>` with a non-empty layout.
+/// Resolve a click to a link. Primary path: blitz's own hit-testing, which is
+/// glyph-exact for inline links (the hit lands on the text node, whose
+/// ancestors include the `<a>`). Fallback: precomputed anchor boxes, which
+/// cover the padding of `display:inline-block` buttons where a hit resolves
+/// to the container instead.
+fn hit_href(doc: &mut BaseDocument, x: f32, y: f32, scale: f64, boxes: &[LinkBox]) -> Option<String> {
+    let hit = doc.root_element().hit(x, y, scale);
+    if let Some(hit) = hit {
+        let mut id = Some(hit.node_id);
+        while let Some(node_id) = id {
+            let node = doc.get_node(node_id)?;
+            if let Some(href) = node.attr(local_name!("href")) {
+                return Some(href.to_string());
+            }
+            id = node.parent;
+        }
+    }
+    boxes.iter().find(|b| b.contains(x, y)).map(|b| b.href.clone())
+}
+
+/// Absolute boxes for every `<a href>` with a non-empty Taffy layout (padded
+/// buttons and other atomic inline-/block-level anchors; plain inline text
+/// links have no box here and are handled by live hit-testing instead).
 ///
 /// A node's `final_layout.location` is relative to its parent's box (for
 /// inline-level nodes, to the inline root's *content* box), so walking the
@@ -148,6 +246,44 @@ fn collect_links(doc: &BaseDocument) -> Vec<LinkBox> {
 #[cfg(test)]
 mod tests {
     use super::render_email;
+    use std::collections::HashSet;
+
+    /// Sweep a coordinate grid over the document and collect every href the
+    /// hit-tester resolves.
+    fn scan_links(hit: &super::HitTester, w: f32, h: f32) -> HashSet<String> {
+        let mut found = HashSet::new();
+        let mut y = 2.0;
+        while y < h {
+            let mut x = 2.0;
+            while x < w {
+                if let Some(href) = hit.hit(x, y) {
+                    found.insert(href);
+                }
+                x += 8.0;
+            }
+            y += 8.0;
+        }
+        found
+    }
+
+    #[test]
+    fn survives_real_world_urls_and_hits_inline_links() {
+        // Modeled on Google's own mail: a protocol-relative webfont link plus
+        // relative and cid: image sources. This exact shape used to hit
+        // blitz's resolve_url panic when no base_url was set.
+        let html = r#"
+<head><link href="//fonts.googleapis.com/css?family=Google+Sans" rel="stylesheet"></head>
+<body>
+  <img src="cid:logo@mail" width="10" height="10">
+  <img src="images/footer.png" width="10" height="10">
+  <p style="font-family:'Google Sans',Roboto,Arial;">A new sign-in — <a href="https://example.com/check">check activity</a>.</p>
+</body>"#;
+        let (rendered, hit) = render_email(html, 660, 2.0).unwrap();
+        assert!(rendered.height > 0);
+        // The plain inline link is clickable via glyph-level hit-testing.
+        let found = scan_links(&hit, rendered.logical_width, rendered.logical_height);
+        assert!(found.contains("https://example.com/check"), "found: {found:?}");
+    }
 
     const BUTTON_EMAIL: &str = r#"
 <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:24px 0;">
@@ -157,30 +293,22 @@ mod tests {
 </td></tr></table>"#;
 
     #[test]
-    fn renders_and_finds_link_boxes() {
-        let rendered = render_email(BUTTON_EMAIL, 660, 2.0).unwrap();
+    fn renders_and_hits_button_links() {
+        let (rendered, hit) = render_email(BUTTON_EMAIL, 660, 2.0).unwrap();
         assert_eq!(rendered.width, 1320);
         assert!(rendered.height > 100);
         assert_eq!(
             rendered.bgra.len(),
             (rendered.width * rendered.height * 4) as usize
         );
-
-        let link = rendered
-            .links
-            .iter()
-            .find(|l| l.href == "https://example.com/invoice")
-            .expect("anchor box collected");
-        // The button is horizontally centered; its box must contain the
-        // horizontal center of the document at its own vertical midpoint.
-        let (cx, cy) = (330.0, (link.y0 + link.y1) / 2.0);
-        assert!(
-            link.contains(cx, cy),
-            "expected {link:?} to contain ({cx},{cy})"
-        );
-        assert!(link.x1 - link.x0 > 80.0 && link.y1 - link.y0 > 20.0);
-
         // The white canvas actually painted: the top-left pixel is opaque white.
         assert_eq!(&rendered.bgra[0..4], &[255, 255, 255, 255]);
+
+        // The whole button — padding included — resolves to the link.
+        let found = scan_links(&hit, rendered.logical_width, rendered.logical_height);
+        assert!(found.contains("https://example.com/invoice"), "found: {found:?}");
+
+        // A click nowhere near a link resolves to nothing.
+        assert_eq!(hit.hit(4.0, 4.0), None);
     }
 }

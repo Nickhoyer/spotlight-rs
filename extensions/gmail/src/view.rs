@@ -21,7 +21,7 @@ use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
 use crate::client::{GmailClient, INBOX_URL};
-use crate::htmlview::{self, LinkBox};
+use crate::htmlview::{self, HitTester};
 use crate::models::{self, Email, Inbox, MailBody};
 
 /// Logical width the email body is rendered at (typical email design width).
@@ -54,10 +54,10 @@ fn store_body(account: &str, uid: u32, body: MailBody) {
 /// The drill-in reading pane's content state.
 enum ReadState {
     Loading,
-    /// Blitz-rendered HTML: an image plus clickable link boxes.
+    /// Blitz-rendered HTML: an image plus a live hit-tester for link clicks.
     Html {
         image: Arc<RenderImage>,
-        links: Vec<LinkBox>,
+        hit: HitTester,
         logical_w: f32,
         logical_h: f32,
     },
@@ -291,14 +291,14 @@ impl GmailView {
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let state = match rendered {
-                        Ok(r) => {
+                        Ok((r, hit)) => {
                             let buffer = image::RgbaImage::from_raw(r.width, r.height, r.bgra);
                             match buffer {
                                 Some(buffer) => ReadState::Html {
                                     image: Arc::new(RenderImage::new(vec![image::Frame::new(
                                         buffer,
                                     )])),
-                                    links: r.links,
+                                    hit,
                                     logical_w: r.logical_width,
                                     logical_h: r.logical_height,
                                 },
@@ -334,7 +334,7 @@ impl GmailView {
     /// document coordinates and open the link under the pointer, if any.
     fn click_body(&mut self, position: Point<Pixels>, _cx: &mut Context<Self>) {
         let Some(Reading {
-            state: ReadState::Html { links, .. },
+            state: ReadState::Html { hit, .. },
             ..
         }) = &self.reading
         else {
@@ -343,8 +343,8 @@ impl GmailView {
         let bounds = self.body_bounds.get();
         let local_x = f32::from(position.x - bounds.origin.x);
         let local_y = f32::from(position.y - bounds.origin.y);
-        if let Some(link) = links.iter().find(|l| l.contains(local_x, local_y)) {
-            let href = link.href.trim();
+        if let Some(href) = hit.hit(local_x, local_y) {
+            let href = href.trim();
             if href.starts_with("https://") || href.starts_with("http://") || href.starts_with("mailto:") {
                 open_url(href);
             }
