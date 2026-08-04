@@ -9,9 +9,26 @@ use objc::{class, msg_send, sel, sel_impl};
 /// Configure the launcher's window for a clean, borderless translucent look.
 ///
 /// gpui's `WindowKind::PopUp` already gives us a non-activating panel that
-/// floats over fullscreen Spaces. Here we disable the *native* drop shadow so
-/// the system doesn't draw a rectangular shadow around our transparent window —
-/// we render our own rounded shadow inside the panel instead.
+/// floats over fullscreen Spaces, but it leaves two things we have to undo:
+///
+/// * **Style mask.** For `titlebar: None` gpui builds the window titled
+///   (`NSTitledWindowMask | NSFullSizeContentViewWindowMask`), so `NSThemeFrame`
+///   still exists and still paints a frame along the window's top edge. Our
+///   window is much larger than the visible panel (it carries transparent slack
+///   for the open spring and the exit drop), so that frame shows up as a stray
+///   beam floating well above the panel. We drop down to borderless, keeping
+///   only the non-activating-panel bit that the paste-back flow depends on (see
+///   [`show_panel`]). Geometry is unchanged: with `FullSizeContentView` the
+///   content rect already equalled the frame.
+/// * **Background color.** gpui paints non-opaque windows at sRGB alpha 0.0001
+///   rather than `clearColor`, deliberately, "to avoid broken shadow". That
+///   near-zero alpha still counts as *covered* for the window server's hit test,
+///   so the transparent margin around the panel swallows every click instead of
+///   letting it through to the app underneath — which also meant clicking there
+///   never resigned key, and so never dismissed the launcher. We have no native
+///   shadow to keep well-formed (we disable it below and draw our own rounded
+///   one inside the panel), so `clearColor` is safe here and makes the alpha-0
+///   region a genuine hole.
 ///
 /// `ns_view` is the `AppKitWindowHandle::ns_view` pointer; safe to pass null.
 pub fn configure_panel(ns_view: *mut c_void) {
@@ -27,6 +44,17 @@ pub fn configure_panel(ns_view: *mut c_void) {
             return;
         }
         const NO: i8 = 0;
+        // NSWindowStyleMaskBorderless (0) | NSWindowStyleMaskNonactivatingPanel.
+        const BORDERLESS_NONACTIVATING_PANEL: u64 = 1 << 7;
+        let _: () = msg_send![window, setStyleMask: BORDERLESS_NONACTIVATING_PANEL];
+        // Changing the style mask rebuilds the window frame, which can drop the
+        // first responder and the movable flag gpui set at creation time.
+        let _: () = msg_send![window, makeFirstResponder: view];
+        let _: () = msg_send![window, setMovable: NO];
+
+        let clear: *mut Object = msg_send![class!(NSColor), clearColor];
+        let _: () = msg_send![window, setBackgroundColor: clear];
+
         let _: () = msg_send![window, setHasShadow: NO];
         let _: () = msg_send![window, invalidateShadow];
     }

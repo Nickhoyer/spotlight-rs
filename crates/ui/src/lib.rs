@@ -28,8 +28,8 @@ use gpui::prelude::*;
 use gpui::{
     div, ease_in_out, img, linear, point, px, size, Animation, AnimationExt as _, AnyElement, AnyView,
     App, Bounds, ClipboardItem, Context, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
-    ObjectFit, RenderImage, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions,
+    MouseDownEvent, ObjectFit, RenderImage, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions,
 };
 
 use spotlight_config::{AppConfig, Recent};
@@ -1567,7 +1567,7 @@ impl Render for SpotlightView {
             .flex_col()
             .items_center()
             .pt(px(top))
-            .child(self.open_reveal(body, window))
+            .child(self.open_reveal(body, window, cx))
     }
 }
 
@@ -1732,6 +1732,28 @@ fn spring_out(x: f32) -> f32 {
 }
 
 impl SpotlightView {
+    /// Dismiss when a mouse-down lands inside our window but outside the panel.
+    ///
+    /// The window is far larger than the panel (transparent slack for the open
+    /// spring and the exit drop). Its fully transparent pixels are holes in the
+    /// window server's hit test — see `configure_panel` — so clicks out there
+    /// reach the app underneath and the resulting deactivation hides us. The
+    /// panel's soft `shadow_lg` ring is *not* fully transparent though, so
+    /// clicks in that band still land on us; catch them here so the dead zone
+    /// around the panel edge dismisses too.
+    ///
+    /// `on_mouse_down_out` is capture-phase and bounds-checked against this
+    /// element, so clicks inside the panel are untouched, and it needs no
+    /// element id (which the id-less wrapper below depends on).
+    fn dismiss_on_click_out(&self, panel: gpui::Div, cx: &Context<Self>) -> gpui::Div {
+        if std::env::var_os("SPOTLIGHT_CAPTURE").is_some() {
+            return panel;
+        }
+        panel.on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+            this.hide(window, cx);
+        }))
+    }
+
     /// Wrap the panel body in the springy open-reveal: it begins blurred,
     /// transparent, and stretched a touch wide, then unblurs, fades in, and
     /// springs down to its resting width. The exit is the same curve reversed.
@@ -1740,7 +1762,7 @@ impl SpotlightView {
     /// can stay id-less — an id-bearing wrapper would prefix every descendant's
     /// `GlobalElementId` and reset the per-screen fades on every show/hide.
     /// Skipped under capture so screenshots stay crisp.
-    fn open_reveal(&self, body: AnyElement, window: &Window) -> AnyElement {
+    fn open_reveal(&self, body: AnyElement, window: &Window, cx: &Context<Self>) -> AnyElement {
         // Current eased panel width (set by `tick_width` during `render_body`).
         let base_w = self.cur_w.unwrap_or_else(|| self.panel_width(&self.screen));
         if std::env::var_os("SPOTLIGHT_CAPTURE").is_some() {
@@ -1764,8 +1786,7 @@ impl SpotlightView {
         if raw_blur < 1.0 || raw_spring < 1.0 {
             window.request_animation_frame();
         }
-        div()
-            .w(px(base_w * scale))
+        self.dismiss_on_click_out(div().w(px(base_w * scale)), cx)
             .child(body)
             .blur(px(blur))
             .opacity(opacity)
@@ -1775,6 +1796,8 @@ impl SpotlightView {
     /// Exit animation: the panel drops away under gravity while fading. Physics is
     /// a body released from rest under constant acceleration, so the offset grows
     /// with the square of elapsed time (`y = ½·g·t²`).
+    /// No click-out dismissal here: we're already on the way out, so a stray
+    /// click in the margin has nothing left to dismiss.
     fn exit_fall(&self, body: AnyElement, secs: f32, window: &Window) -> AnyElement {
         let base_w = self.cur_w.unwrap_or_else(|| self.panel_width(&self.screen));
         let raw = (secs / (EXIT_MS as f32 / 1000.0)).clamp(0.0, 1.0);
