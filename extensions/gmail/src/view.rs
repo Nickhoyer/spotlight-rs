@@ -73,6 +73,9 @@ enum ReadState {
 struct Reading {
     email: Email,
     state: ReadState,
+    /// Whether the user opted into fetching this message's remote images
+    /// (per-open; never remembered, so trackers only fire on explicit ask).
+    images_loaded: bool,
 }
 
 pub struct GmailView {
@@ -265,10 +268,11 @@ impl GmailView {
         self.reading = Some(Reading {
             email: email.clone(),
             state: ReadState::Loading,
+            images_loaded: false,
         });
 
         if let Some(body) = cached_body(&self.account, uid) {
-            self.present_body(uid, body, scale, cx);
+            self.present_body(uid, body, scale, false, cx);
         } else if let Some(client) = self.client.clone() {
             cx.spawn(async move |this, cx| {
                 let result = cx
@@ -281,7 +285,7 @@ impl GmailView {
                         if let Some(email) = this.inbox.emails.iter_mut().find(|e| e.uid == uid) {
                             fill_snippet(email, &body);
                         }
-                        this.present_body(uid, body, scale, cx);
+                        this.present_body(uid, body, scale, false, cx);
                     }
                     Err(e) => {
                         crate::debug_log(&format!("fetch uid={uid}: FAILED: {e}"));
@@ -297,9 +301,40 @@ impl GmailView {
         cx.notify();
     }
 
+    /// Re-render the open message with remote images fetched (explicit,
+    /// per-message opt-in — this is the only network the renderer ever gets).
+    fn load_images(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(reading) = self.reading.as_mut() else {
+            return;
+        };
+        if reading.images_loaded {
+            return;
+        }
+        let uid = reading.email.uid;
+        let Some(body) = cached_body(&self.account, uid) else {
+            return;
+        };
+        if body.html.is_none() {
+            return;
+        }
+        reading.images_loaded = true;
+        reading.state = ReadState::Loading;
+        let scale = window.scale_factor() as f64;
+        crate::debug_log(&format!("load images uid={uid}"));
+        self.present_body(uid, body, scale, true, cx);
+        cx.notify();
+    }
+
     /// Move a fetched body into the pane: render HTML via Blitz in the
     /// background, or fall straight through to text.
-    fn present_body(&mut self, uid: u32, body: MailBody, scale: f64, cx: &mut Context<Self>) {
+    fn present_body(
+        &mut self,
+        uid: u32,
+        body: MailBody,
+        scale: f64,
+        load_images: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.reading.as_ref().map(|r| r.email.uid) != Some(uid) {
             return;
         }
@@ -309,7 +344,7 @@ impl GmailView {
             cx.spawn(async move |this, cx| {
                 let rendered = cx
                     .background_executor()
-                    .spawn(async move { htmlview::render_email(&html, width, scale) })
+                    .spawn(async move { htmlview::render_email(&html, width, scale, load_images) })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let state = match rendered {
@@ -408,6 +443,7 @@ impl GmailView {
                 "o" => {
                     open_url(&reading.email.gmail_url());
                 }
+                "i" => self.load_images(window, cx),
                 _ => return,
             }
             cx.stop_propagation();
@@ -524,6 +560,12 @@ impl GmailView {
             return centered("");
         };
         let email = reading.email.clone();
+        // Offer image loading only when there's an HTML body and the user
+        // hasn't already opted in for this open.
+        let show_load_images = !reading.images_loaded
+            && cached_body(&self.account, email.uid)
+                .map(|b| b.html.is_some())
+                .unwrap_or(false);
         let age = models::age_label(&email, models::now_unix());
         let byline = match (email.sender(), age.as_str()) {
             (s, "") => s.to_string(),
@@ -573,6 +615,27 @@ impl GmailView {
                         ),
                     ),
             )
+            .when(show_load_images, |this| {
+                this.child(
+                    div()
+                        .id("gmail-load-images")
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .rounded_lg()
+                        .bg(theme::tile())
+                        .hover(|s| s.bg(theme::hover_strong()))
+                        .text_xs()
+                        .text_color(theme::accent())
+                        .child("Load images")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window: &mut Window, cx| {
+                                this.load_images(window, cx)
+                            }),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("gmail-read-open")
