@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Entitlements for the hardened runtime, which notarization requires.
+
+	Deliberately empty. The two capabilities that matter to this app need no
+	entitlement:
+	  * Accessibility (the synthetic ⌘V paste) is a TCC grant, not an
+	    entitlement — the user approves it in System Settings.
+	  * Metal runtime shader compilation works fine under the hardened runtime.
+
+	If notarization passes but the signed build crashes on launch, add the
+	narrowest entitlement that fixes it and note why:
+	  com.apple.security.cs.disable-library-validation  — loading a dylib
+	      signed by someone else (unlikely; we link statically)
+	  com.apple.security.cs.allow-jit                   — a JIT mapping
+	  com.apple.security.automation.apple-events        — driving another app
+	      via AppleEvents (also needs an NSAppleEventsUsageDescription)
+	-->
+</dict>
+</plist>

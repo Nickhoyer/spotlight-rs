@@ -24,6 +24,25 @@ jobs:
       # so steps can gate on its presence (a missing key skips the cask bump
       # instead of failing the whole release).
       TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+
+      # Developer ID signing + notarization. Same pattern: exposed at job level
+      # so steps can gate on presence, and a repo without these secrets still
+      # produces an (ad-hoc, un-notarized) release rather than failing.
+      #   MACOS_CERT_P12       base64 of the exported "Developer ID Application"
+      #                        .p12 — `base64 -i cert.p12 | pbcopy`
+      #   MACOS_CERT_PASSWORD  the password set when exporting that .p12
+      #   MACOS_SIGN_IDENTITY  "Developer ID Application: Name (TEAMID)"
+      #   NOTARY_KEY_P8        base64 of the App Store Connect API key .p8
+      #   NOTARY_KEY_ID        that key's Key ID
+      #   NOTARY_ISSUER        the Issuer ID from App Store Connect → Keys
+      # An API key is used rather than an app-specific password because it is
+      # revocable on its own and is not tied to a personal Apple ID session.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -71,9 +90,54 @@ jobs:
           /usr/bin/plutil -replace CFBundleShortVersionString -string "$V" packaging/Info.plist
           /usr/bin/plutil -replace CFBundleVersion -string "$V" packaging/Info.plist
 
+      - name: Import signing certificate
+        id: signing
+        if: steps.ver.outputs.release == 'true' && env.MACOS_CERT_P12 != ''
+        run: |
+          set -euo pipefail
+          # A throwaway keychain scoped to this job: the runner is ephemeral, but
+          # this keeps the key out of the login keychain and lets the cleanup
+          # step delete it wholesale.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"   # don't auto-lock mid-build
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Without this, codesign blocks on a GUI "allow access to key?" prompt
+          # that nothing on a headless runner can answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          # codesign searches the keychain *search list*, not just the file.
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
       - name: Build bundle
         if: steps.ver.outputs.release == 'true'
-        run: ./scripts/bundle.sh
+        run: |
+          set -euo pipefail
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ] && [ "${{ steps.signing.outcome }}" = "success" ]; then
+            export SIGN_IDENTITY="$MACOS_SIGN_IDENTITY"
+          fi
+          if [ -n "${NOTARY_KEY_P8:-}" ]; then
+            printf '%s' "$NOTARY_KEY_P8" | base64 --decode >"$RUNNER_TEMP/notary.p8"
+            export NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+          fi
+          ./scripts/bundle.sh
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
 
       - name: Tag and publish release
         if: steps.ver.outputs.release == 'true'

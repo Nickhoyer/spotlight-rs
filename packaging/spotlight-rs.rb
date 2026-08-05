@@ -6,10 +6,15 @@
 #   3. Fill in `version` and `sha256` (the shasum printed by bundle.sh) below
 #   4. Publish via your own tap:  brew install --cask <user>/tap/spotlight-rs
 #
-# NOTE: the app is ad-hoc signed, not notarized. On first launch macOS Gatekeeper
-# will block it; users right-click → Open once, or run:
+# NOTE: releases built without the Developer ID secrets are ad-hoc signed and not
+# notarized. On first launch macOS Gatekeeper will block those; users right-click
+# → Open once, or run:
 #   xattr -dr com.apple.quarantine "/Applications/Spotlight-rs.app"
-# The `quarantine` stanza below asks Homebrew to strip the attribute on install.
+# The postflight below asks Homebrew to strip the attribute on install.
+#
+# Once the first notarized release ships (see scripts/bundle.sh), drop that
+# postflight — a stapled build passes Gatekeeper on its own, and stripping
+# quarantine on a notarized app just skips a check that would have succeeded.
 cask "spotlight-rs" do
   version "0.1.0"
   sha256 "1b3fbc3562163346e488716d25ad9c036083c1d295820071870e3be81ddfe7f1"
