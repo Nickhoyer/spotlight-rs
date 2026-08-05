@@ -52,6 +52,10 @@ pub fn icon_path() -> String {
 pub struct GmailConfig {
     #[serde(default)]
     pub email: String,
+    /// Fetch every opened message's remote images without asking. Off by
+    /// default: loading images is what fires tracking pixels.
+    #[serde(default)]
+    pub auto_load_images: bool,
 }
 
 /// Load the persisted Gmail settings (defaults if unset).

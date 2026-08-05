@@ -81,6 +81,8 @@ struct Reading {
 pub struct GmailView {
     client: Option<Arc<GmailClient>>,
     account: String,
+    /// Settings → Gmail → "Load remote images automatically".
+    auto_load_images: bool,
     /// Currently shown inbox (may be stale while `fetching`).
     inbox: Inbox,
     fetching: bool,
@@ -112,6 +114,7 @@ impl GmailView {
         let mut view = Self {
             client,
             account: config.email.trim().to_string(),
+            auto_load_images: config.auto_load_images,
             inbox: crate::load_cache(),
             fetching: false,
             error: None,
@@ -264,15 +267,18 @@ impl GmailView {
             "open uid={uid} cached={} scale={scale}",
             cached_body(&self.account, uid).is_some()
         ));
+        // The auto-load setting makes every open behave as if "Load images"
+        // was already pressed.
+        let load_images = self.auto_load_images;
         self.read_scroll.set_offset(Point::default());
         self.reading = Some(Reading {
             email: email.clone(),
             state: ReadState::Loading,
-            images_loaded: false,
+            images_loaded: load_images,
         });
 
         if let Some(body) = cached_body(&self.account, uid) {
-            self.present_body(uid, body, scale, false, cx);
+            self.present_body(uid, body, scale, load_images, cx);
         } else if let Some(client) = self.client.clone() {
             cx.spawn(async move |this, cx| {
                 let result = cx
@@ -285,7 +291,7 @@ impl GmailView {
                         if let Some(email) = this.inbox.emails.iter_mut().find(|e| e.uid == uid) {
                             fill_snippet(email, &body);
                         }
-                        this.present_body(uid, body, scale, false, cx);
+                        this.present_body(uid, body, scale, load_images, cx);
                     }
                     Err(e) => {
                         crate::debug_log(&format!("fetch uid={uid}: FAILED: {e}"));

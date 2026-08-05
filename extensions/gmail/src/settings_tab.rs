@@ -18,7 +18,9 @@ const APP_PASSWORDS_URL: &str = "https://myaccount.google.com/apppasswords";
 pub struct GmailSettingsTab {
     email: Entity<TextInput>,
     password: Entity<TextInput>,
+    auto_load_images: bool,
     help_focus: FocusHandle,
+    images_focus: FocusHandle,
     /// Blur subscriptions for the text fields.
     subs: Vec<Subscription>,
 }
@@ -43,16 +45,24 @@ impl GmailSettingsTab {
         Self {
             email,
             password,
+            auto_load_images: cfg.auto_load_images,
             help_focus: cx.focus_handle(),
+            images_focus: cx.focus_handle(),
             subs: Vec::new(),
         }
     }
 
-    /// Write the config blob (address only — no secrets).
+    /// Write the config blob (no secrets).
     fn persist(&mut self, cx: &mut Context<Self>) {
         let email = self.email.read(cx).value().trim().to_string();
         let mut app = AppConfig::load();
-        let _ = app.set(crate::EXT_ID, &GmailConfig { email });
+        let _ = app.set(
+            crate::EXT_ID,
+            &GmailConfig {
+                email,
+                auto_load_images: self.auto_load_images,
+            },
+        );
         let _ = app.save();
         cx.notify();
     }
@@ -132,6 +142,15 @@ impl Render for GmailSettingsTab {
                     ))),
             );
 
+        let reading = controls::settings_row(
+            "Load remote images automatically",
+            "Senders can tell when and where you open their mail (tracking pixels).",
+            controls::toggle(&self.images_focus, self.auto_load_images, cx, |this, _, cx| {
+                this.auto_load_images = !this.auto_load_images;
+                this.persist(cx);
+            }),
+        );
+
         div()
             .id("gmail-settings")
             .flex()
@@ -139,5 +158,6 @@ impl Render for GmailSettingsTab {
             .size_full()
             .overflow_y_scroll()
             .child(controls::section("Account", account))
+            .child(controls::section("Reading", reading))
     }
 }
