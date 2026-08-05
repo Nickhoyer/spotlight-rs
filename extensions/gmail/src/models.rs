@@ -23,6 +23,14 @@ pub struct Email {
     pub timestamp: i64,
     /// Pre-rendered "Jul 28" label, shown for mail older than a day.
     pub date_label: String,
+    /// Whether the message lacks `\Seen`. Defaults to true on deserialize:
+    /// older caches only ever held unread mail.
+    #[serde(default = "default_unread")]
+    pub unread: bool,
+}
+
+fn default_unread() -> bool {
+    true
 }
 
 impl Email {

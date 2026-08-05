@@ -20,7 +20,7 @@ use gpui::{
 use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
-use crate::client::{GmailClient, INBOX_URL};
+use crate::client::{GmailClient, InboxFilter, INBOX_URL};
 use crate::htmlview::{self, HitTester};
 use crate::models::{self, Email, Inbox, MailBody};
 
@@ -83,6 +83,9 @@ pub struct GmailView {
     account: String,
     /// Settings → Gmail → "Load remote images automatically".
     auto_load_images: bool,
+    /// Which messages the list shows (Unread by default; ←/→ or the header
+    /// chips switch).
+    filter: InboxFilter,
     /// Currently shown inbox (may be stale while `fetching`).
     inbox: Inbox,
     fetching: bool,
@@ -110,12 +113,19 @@ impl GmailView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config = crate::load_config();
         let client = crate::build_client(&config);
+        // Capture aid (mirrors the SPOTLIGHT_CAPTURE_* knobs): open on the
+        // All filter instead of Unread.
+        let filter = match std::env::var("SPOTLIGHT_GMAIL_FILTER").as_deref() {
+            Ok("all") => InboxFilter::All,
+            _ => InboxFilter::default(),
+        };
 
         let mut view = Self {
             client,
             account: config.email.trim().to_string(),
             auto_load_images: config.auto_load_images,
-            inbox: crate::load_cache(),
+            filter,
+            inbox: crate::load_cache(filter),
             fetching: false,
             error: None,
             reading: None,
@@ -149,6 +159,18 @@ impl GmailView {
         view
     }
 
+    /// Switch the list between unread-only and everything recent.
+    fn set_filter(&mut self, filter: InboxFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter;
+        self.nav.set(0);
+        self.inbox = crate::load_cache(filter);
+        self.refresh(cx);
+        cx.notify();
+    }
+
     /// Kick off a background fetch (the stale list stays up meanwhile).
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
@@ -158,11 +180,12 @@ impl GmailView {
         self.error = None;
         self.generation += 1;
         let generation = self.generation;
+        let filter = self.filter;
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { client.fetch_inbox() })
+                .spawn(async move { client.fetch_inbox(filter) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // Discard if a newer fetch superseded us.
@@ -185,7 +208,7 @@ impl GmailView {
                                 email.snippet = old.snippet.clone();
                             }
                         }
-                        crate::save_cache(&inbox);
+                        crate::save_cache(filter, &inbox);
                         this.nav.clamp(inbox.emails.len());
                         this.inbox = inbox;
                         this.error = None;
@@ -218,6 +241,7 @@ impl GmailView {
             return;
         }
         let generation = self.generation;
+        let filter = self.filter;
 
         cx.spawn(async move |this, cx| {
             for uid in uids {
@@ -248,7 +272,7 @@ impl GmailView {
                 }
             }
             // Persist the now-filled snippets for the next cold open.
-            let _ = this.update(cx, |this, _| crate::save_cache(&this.inbox));
+            let _ = this.update(cx, |this, _| crate::save_cache(filter, &this.inbox));
         })
         .detach();
     }
@@ -447,6 +471,8 @@ impl GmailView {
         match key {
             "down" if len > 0 => self.nav.next(len),
             "up" if len > 0 => self.nav.prev(),
+            "right" => self.set_filter(InboxFilter::All, cx),
+            "left" => self.set_filter(InboxFilter::Unread, cx),
             "enter" => match self.inbox.emails.get(self.nav.selected).cloned() {
                 Some(email) => self.open_reading(email, window, cx),
                 // Empty inbox: Enter still gets you to Gmail.
@@ -481,6 +507,16 @@ impl GmailView {
             .rounded_lg()
             .when(self.nav.selected == i, |t| t.bg(theme::selected()))
             .hover(|s| s.bg(theme::hover()))
+            // Unread marker: an accent dot (kept as reserved space on read
+            // rows so columns line up in the All view).
+            .child(
+                div().w(px(8.)).flex_none().flex().justify_center().child(
+                    div()
+                        .size(px(6.))
+                        .rounded_full()
+                        .when(email.unread, |d| d.bg(theme::accent())),
+                ),
+            )
             .child(
                 div()
                     .w(px(160.))
@@ -495,7 +531,16 @@ impl GmailView {
                     .items_center()
                     .gap_2()
                     .overflow_hidden()
-                    .child(div().truncate().text_color(theme::accent()).child(subject))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(if email.unread {
+                                theme::accent()
+                            } else {
+                                theme::text()
+                            })
+                            .child(subject),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -513,7 +558,35 @@ impl GmailView {
             .into_any_element()
     }
 
-    /// "N unread" on the left, an "Open Gmail ↗" pill on the right.
+    fn filter_chip(
+        &self,
+        label: &'static str,
+        filter: InboxFilter,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.filter == filter;
+        div()
+            .id(label)
+            .px_3()
+            .py_1()
+            .rounded_lg()
+            .when(selected, |t| t.bg(theme::selected()))
+            .hover(|s| s.bg(theme::hover()))
+            .text_xs()
+            .text_color(if selected {
+                theme::accent()
+            } else {
+                theme::muted()
+            })
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.set_filter(filter, cx)),
+            )
+    }
+
+    /// Unread/All chips + "N unread" on the left, an "Open Gmail ↗" pill on
+    /// the right.
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.inbox.fullcount;
         let label = match count {
@@ -527,7 +600,15 @@ impl GmailView {
             .justify_between()
             .px_4()
             .py_2()
-            .child(div().text_xs().text_color(theme::muted()).child(label))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.filter_chip("Unread", InboxFilter::Unread, cx))
+                    .child(self.filter_chip("All", InboxFilter::All, cx))
+                    .child(div().pl_2().text_xs().text_color(theme::muted()).child(label)),
+            )
             .child(
                 div()
                     .id("gmail-open-inbox")
@@ -784,6 +865,8 @@ impl Render for GmailView {
             centered(err)
         } else if self.fetching {
             centered("Checking mail…")
+        } else if self.filter == InboxFilter::All {
+            centered("Inbox is empty.")
         } else {
             centered("Inbox zero — nothing unread. ✨")
         };

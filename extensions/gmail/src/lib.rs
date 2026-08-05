@@ -85,23 +85,27 @@ pub fn build_client(cfg: &GmailConfig) -> Option<Arc<GmailClient>> {
     Some(client)
 }
 
-fn cache_path() -> std::path::PathBuf {
-    spotlight_config::cache_dir().join("gmail-inbox.json")
+fn cache_path(filter: client::InboxFilter) -> std::path::PathBuf {
+    let name = match filter {
+        client::InboxFilter::Unread => "gmail-inbox.json",
+        client::InboxFilter::All => "gmail-inbox-all.json",
+    };
+    spotlight_config::cache_dir().join(name)
 }
 
-/// Load the cached inbox (empty on miss/corruption).
-pub fn load_cache() -> Inbox {
-    std::fs::read_to_string(cache_path())
+/// Load the cached inbox for a filter (empty on miss/corruption).
+pub fn load_cache(filter: client::InboxFilter) -> Inbox {
+    std::fs::read_to_string(cache_path(filter))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-/// Persist the latest inbox so the next open renders instantly.
-pub fn save_cache(inbox: &Inbox) {
+/// Persist the latest inbox for a filter so the next open renders instantly.
+pub fn save_cache(filter: client::InboxFilter, inbox: &Inbox) {
     let _ = std::fs::create_dir_all(spotlight_config::cache_dir());
     if let Ok(json) = serde_json::to_string(inbox) {
-        let _ = std::fs::write(cache_path(), json);
+        let _ = std::fs::write(cache_path(filter), json);
     }
 }
 

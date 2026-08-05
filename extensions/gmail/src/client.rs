@@ -20,10 +20,18 @@ use crate::models::{self, Email, Inbox, MailBody};
 
 const HOST: &str = "imap.gmail.com";
 const PORT: u16 = 993;
-/// Newest unread messages shown in the list.
+/// Newest messages shown in the list.
 const MAX_EMAILS: usize = 30;
 /// Where a plain "open my inbox" lands.
 pub const INBOX_URL: &str = "https://mail.google.com/mail/";
+
+/// Which messages the list shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InboxFilter {
+    #[default]
+    Unread,
+    All,
+}
 
 type Session = imap::Session<native_tls::TlsStream<TcpStream>>;
 
@@ -79,32 +87,53 @@ impl GmailClient {
         Ok(result)
     }
 
-    /// Fetch the unread INBOX list: total count plus headers for the newest
-    /// [`MAX_EMAILS`] (no bodies — those come from [`Self::fetch_body`]).
-    pub fn fetch_inbox(&self) -> Result<Inbox> {
-        let uids = self.with_session(|s| s.uid_search("UNSEEN"))?;
-        let fullcount = uids.len() as u32;
+    /// Fetch the INBOX list for `filter`: the unread total plus headers for
+    /// the newest [`MAX_EMAILS`] matching messages (no bodies — those come
+    /// from [`Self::fetch_body`]).
+    pub fn fetch_inbox(&self, filter: InboxFilter) -> Result<Inbox> {
+        let unread_uids = self.with_session(|s| s.uid_search("UNSEEN"))?;
+        let fullcount = unread_uids.len() as u32;
 
-        let mut uids: Vec<u32> = uids.into_iter().collect();
-        uids.sort_unstable_by(|a, b| b.cmp(a));
-        uids.truncate(MAX_EMAILS);
-        if uids.is_empty() {
-            return Ok(Inbox::default());
-        }
-
-        let set = uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetches = self.with_session(|s| s.uid_fetch(&set, "(UID RFC822.HEADER)"))?;
+        let fetches = match filter {
+            InboxFilter::Unread => {
+                let mut uids: Vec<u32> = unread_uids.into_iter().collect();
+                uids.sort_unstable_by(|a, b| b.cmp(a));
+                uids.truncate(MAX_EMAILS);
+                if uids.is_empty() {
+                    return Ok(Inbox::default());
+                }
+                let set = uids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.with_session(|s| s.uid_fetch(&set, "(UID FLAGS RFC822.HEADER)"))?
+            }
+            InboxFilter::All => {
+                // Newest N regardless of read state: a sequence-number range
+                // off the mailbox size (SEARCH ALL would return every UID in
+                // the mailbox).
+                let exists = self.with_session(|s| s.examine("INBOX").map(|m| m.exists))?;
+                if exists == 0 {
+                    return Ok(Inbox::default());
+                }
+                let start = exists.saturating_sub(MAX_EMAILS as u32 - 1).max(1);
+                let set = format!("{start}:{exists}");
+                self.with_session(|s| s.fetch(&set, "(UID FLAGS RFC822.HEADER)"))?
+            }
+        };
 
         let mut emails: Vec<Email> = fetches
             .iter()
             .filter_map(|fetch| {
                 let uid = fetch.uid?;
                 let header = fetch.header()?;
-                Some(email_from_header(uid, header))
+                let mut email = email_from_header(uid, header);
+                email.unread = !fetch
+                    .flags()
+                    .iter()
+                    .any(|flag| matches!(flag, imap::types::Flag::Seen));
+                Some(email)
             })
             .collect();
         emails.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
