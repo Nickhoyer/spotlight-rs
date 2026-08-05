@@ -94,6 +94,15 @@ pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<(Rende
                 "render: start {}B html at {logical_width}px @{scale}x",
                 html.len()
             ));
+            // With the dump knob on, also save the exact source we're about
+            // to render so a transparent output can be reproduced offline.
+            if std::env::var_os("SPOTLIGHT_GMAIL_DUMP_RENDER").is_some() {
+                let path = spotlight_config::cache_dir().join("gmail-render-source.html");
+                match std::fs::write(&path, &html) {
+                    Ok(()) => crate::debug_log(&format!("render: source dumped to {}", path.display())),
+                    Err(e) => crate::debug_log(&format!("render: source dump failed: {e}")),
+                }
+            }
             let started = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 build_and_render(&html, logical_width, scale)
@@ -183,19 +192,28 @@ fn build_and_render(
         height,
     );
 
-    // Diagnostic: how much of the render is non-white? A ~0% figure on a
-    // text-bearing email means blitz painted nothing visible (e.g. font
-    // loading failure) even though the pipeline "worked".
+    // Diagnostic: what did the rasterizer actually produce? ~100% transparent
+    // means vello painted nothing (the injected white page background didn't
+    // even land) — the classic symptom being a blank card in the UI while
+    // every pipeline stage reports success. ~100% white with no content means
+    // layout/paint ran but text didn't (e.g. font loading failure).
     let sampled = bgra.chunks_exact(4).step_by(16);
-    let (mut total, mut nonwhite) = (0u64, 0u64);
+    let (mut total, mut transparent, mut white, mut content) = (0u64, 0u64, 0u64, 0u64);
     for px in sampled {
         total += 1;
-        if px != [255, 255, 255, 255] {
-            nonwhite += 1;
+        match px {
+            [_, _, _, 0] => transparent += 1,
+            [255, 255, 255, 255] => white += 1,
+            _ => content += 1,
         }
     }
-    let nonwhite_pct = (nonwhite as f64 / total.max(1) as f64) * 100.0;
-    crate::debug_log(&format!("render: content {nonwhite_pct:.1}% non-white"));
+    let pct = |n: u64| (n as f64 / total.max(1) as f64) * 100.0;
+    crate::debug_log(&format!(
+        "render: pixels {:.1}% transparent / {:.1}% white / {:.1}% content",
+        pct(transparent),
+        pct(white),
+        pct(content)
+    ));
     if std::env::var_os("SPOTLIGHT_GMAIL_DUMP_RENDER").is_some() {
         dump_render(&bgra, width, height);
     }
