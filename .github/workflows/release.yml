@@ -114,8 +114,11 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
 
-          # codesign searches the keychain *search list*, not just the file.
-          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          # codesign searches the keychain *search list*, not just the file, so
+          # prepend ours to whatever the runner image already has rather than
+          # naming login.keychain-db and hoping the image still calls it that.
+          EXISTING=$(security list-keychains -d user | sed -e 's/^[[:space:]]*//' -e 's/"//g')
+          security list-keychain -d user -s "$KEYCHAIN" $EXISTING
 
           security find-identity -v -p codesigning "$KEYCHAIN"
 
