@@ -182,6 +182,24 @@ fn build_and_render(
         width,
         height,
     );
+
+    // Diagnostic: how much of the render is non-white? A ~0% figure on a
+    // text-bearing email means blitz painted nothing visible (e.g. font
+    // loading failure) even though the pipeline "worked".
+    let sampled = bgra.chunks_exact(4).step_by(16);
+    let (mut total, mut nonwhite) = (0u64, 0u64);
+    for px in sampled {
+        total += 1;
+        if px != [255, 255, 255, 255] {
+            nonwhite += 1;
+        }
+    }
+    let nonwhite_pct = (nonwhite as f64 / total.max(1) as f64) * 100.0;
+    crate::debug_log(&format!("render: content {nonwhite_pct:.1}% non-white"));
+    if std::env::var_os("SPOTLIGHT_GMAIL_DUMP_RENDER").is_some() {
+        dump_render(&bgra, width, height);
+    }
+
     // RGBA (blitz) → BGRA (gpui RenderImage).
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -196,6 +214,29 @@ fn build_and_render(
         bgra,
     };
     Ok((document, rendered, boxes))
+}
+
+/// Diagnostic (`SPOTLIGHT_GMAIL_DUMP_RENDER=1`): write the still-RGBA render
+/// to `<cache>/gmail-render-<WxH>.png` so a suspect image can be inspected
+/// directly. The png codec comes in via the workspace `image` features.
+fn dump_render(rgba: &[u8], width: u32, height: u32) {
+    use image::ImageEncoder as _;
+    let path = spotlight_config::cache_dir().join(format!("gmail-render-{width}x{height}.png"));
+    let _ = std::fs::create_dir_all(spotlight_config::cache_dir());
+    let encode = || -> anyhow::Result<()> {
+        let file = std::fs::File::create(&path)?;
+        image::codecs::png::PngEncoder::new(std::io::BufWriter::new(file)).write_image(
+            rgba,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        Ok(())
+    };
+    match encode() {
+        Ok(()) => crate::debug_log(&format!("render: dumped {}", path.display())),
+        Err(e) => crate::debug_log(&format!("render: dump failed: {e}")),
+    }
 }
 
 /// Resolve a click to a link. Primary path: blitz's own hit-testing, which is
