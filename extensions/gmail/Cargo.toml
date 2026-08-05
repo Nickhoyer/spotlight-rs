@@ -19,5 +19,6 @@ blitz-html.workspace = true
 blitz-paint.workspace = true
 blitz-traits.workspace = true
 image.workspace = true
+log.workspace = true
 spotlight-config.workspace = true
 spotlight-ui.workspace = true

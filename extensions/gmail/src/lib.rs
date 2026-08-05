@@ -120,8 +120,35 @@ pub fn save_cache(inbox: &Inbox) {
     }
 }
 
+/// Bridge `log` records (gpui reports image/texture failures through it, and
+/// nothing else in the app installs a logger, so they normally vanish) into
+/// the gmail debug log. Warn+ only.
+fn install_log_bridge() {
+    struct Bridge;
+    impl log::Log for Bridge {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                debug_log(&format!(
+                    "log[{}] {}: {}",
+                    record.level(),
+                    record.target(),
+                    record.args()
+                ));
+            }
+        }
+        fn flush(&self) {}
+    }
+    if log::set_boxed_logger(Box::new(Bridge)).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+}
+
 /// The Home shortcut + full-screen panel for Gmail.
 pub fn panel_entry() -> PanelEntry {
+    install_log_bridge();
     PanelEntry {
         id: EXT_ID.to_string(),
         title: "Gmail".to_string(),

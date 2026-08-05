@@ -624,16 +624,27 @@ impl GmailView {
                     .h(px(*logical_h))
                     .rounded_lg()
                     .overflow_hidden()
+                    // White under the image: emails are white anyway, and if
+                    // the image itself fails to paint this shows a white card
+                    // (image problem) instead of nothing (layout problem).
+                    .bg(gpui::rgb(0xffffff))
                     .child(
                         img(ImageSource::Render(image.clone()))
                             .w(px(*logical_w))
                             .h(px(*logical_h)),
                     )
                     // Capture the card's painted bounds each frame so clicks can
-                    // be mapped from window space into document space.
+                    // be mapped from window space into document space. Log when
+                    // the size changes — i.e. once per open — as proof the card
+                    // actually laid out.
                     .child(
                         canvas(
-                            move |bounds, _, _| bounds_cell.set(bounds),
+                            move |bounds, _, _| {
+                                if bounds_cell.get().size != bounds.size {
+                                    crate::debug_log(&format!("card painted at {bounds:?}"));
+                                }
+                                bounds_cell.set(bounds)
+                            },
                             |_, _, _, _| {},
                         )
                         .absolute()

@@ -57,6 +57,8 @@ blitz-paint = "=0.3.0-beta.1"
 blitz-traits = "=0.3.0-beta.1"
 # Must match gpui's image version (RenderImage frames are image::Frame).
 image = { version = "0.25", default-features = false }
+# Bridge gpui's internal warn/error records into the gmail debug log.
+log = "0.4"
 # macOS Keychain storage for the Jira API token in release builds.
 security-framework = "2"
 

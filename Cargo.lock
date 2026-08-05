@@ -2009,6 +2009,7 @@ dependencies = [
  "gpui",
  "image",
  "imap",
+ "log",
  "mail-parser",
  "native-tls",
  "serde",
