@@ -152,15 +152,62 @@ pub fn render_email(html: &str, logical_width: u32, scale: f64) -> Result<(Rende
     Ok((rendered, HitTester { query: query_tx }))
 }
 
+/// Remove external-stylesheet references (`<link …>` tags and `@import`
+/// rules) before parsing. There is no net provider, so they could never load
+/// — and blitz suppresses ALL painting while such "critical resources" are
+/// pending, which turned every email with a webfont/stylesheet link into a
+/// fully transparent render. Emails lose nothing: without network, a `<link>`
+/// can't contribute styles anyway (and not fetching is the privacy point).
+fn sanitize(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        let rest = &lower[i..];
+        if rest.starts_with("<link")
+            && matches!(
+                rest.as_bytes().get(5),
+                Some(b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')
+            )
+        {
+            i += rest.find('>').map(|e| e + 1).unwrap_or(rest.len());
+        } else if rest.starts_with("@import") {
+            // Drop through the terminating ';' (or stop at a tag boundary if
+            // the rule is malformed).
+            let end = match (rest.find(';'), rest.find('<')) {
+                (Some(s), Some(t)) if s < t => s + 1,
+                (Some(_) | None, Some(t)) => t,
+                (Some(s), None) => s + 1,
+                (None, None) => rest.len(),
+            };
+            i += end;
+        } else {
+            let ch = html[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 fn build_and_render(
     html: &str,
     logical_width: u32,
     scale: f64,
 ) -> Result<(HtmlDocument, RenderedEmail, Vec<LinkBox>)> {
     // Emails render on white regardless of app theme; inject a base style
-    // (author styles still override backgrounds).
+    // (author styles still override the backgrounds). The border-collapse
+    // override neutralizes a blitz bug where `border-collapse: collapse` —
+    // boilerplate in email CSS resets, both in stylesheets and inline on
+    // `display:table` divs, hence the universal selector — paints phantom
+    // thick black borders on borderless tables; `separate` is visually
+    // equivalent for them.
     let html = format!(
-        "<style>html {{ background: #ffffff; }} body {{ margin: 8px; }}</style>{html}"
+        "<style>\
+         html {{ background: #ffffff; }} body {{ margin: 8px; }}\
+         * {{ border-collapse: separate !important; }}\
+         </style>{}",
+        sanitize(html)
     );
 
     let mut document = HtmlDocument::from_html(
@@ -346,6 +393,62 @@ mod tests {
         found
     }
 
+    /// Fraction of pixels that are fully transparent — the signature of
+    /// blitz's suppressed paint. A healthy email render is ~0%.
+    fn transparent_pct(rendered: &super::RenderedEmail) -> f64 {
+        let transparent = rendered
+            .bgra
+            .chunks_exact(4)
+            .filter(|px| px[3] == 0)
+            .count() as f64;
+        transparent / (rendered.width as f64 * rendered.height as f64) * 100.0
+    }
+
+    #[test]
+    fn stylesheet_links_dont_suppress_painting() {
+        // The exact shape that shipped blank: XHTML doctype + a Google Fonts
+        // stylesheet <link> + an @import. With no net provider these stay
+        // "pending" forever, and blitz refuses to paint anything while
+        // critical resources are pending — unless we strip them.
+        let html = r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"><head>
+<link href="https://fonts.googleapis.com/css?family=Lato:400,700" rel="stylesheet" type="text/css">
+<style>@import url("https://example.com/more.css"); .x { color: #333; }</style>
+</head><body style="background-color:#fff"><p class="x">Hola mundo</p></body></html>"#;
+        let (rendered, _hit) = render_email(html, 660, 2.0).unwrap();
+        assert!(
+            transparent_pct(&rendered) < 1.0,
+            "paint was suppressed: {:.1}% transparent",
+            transparent_pct(&rendered)
+        );
+    }
+
+    #[test]
+    fn collapsed_borderless_tables_dont_paint_black_bars() {
+        // Email-reset boilerplate + an unloadable image inside a borderless
+        // table: blitz's border-collapse:collapse paints thick phantom
+        // borders (giant black bars) unless we force `separate`.
+        let html = r#"<html><head>
+<style>table,td,tr{border-collapse:collapse;vertical-align:top}</style>
+</head><body>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tbody><tr>
+<td align="center"><img src="https://cdn.example.net/logo.png" alt="Logo" width="493" style="width:85%"></td>
+</tr></tbody></table>
+</body></html>"#;
+        let (rendered, _hit) = render_email(html, 660, 2.0).unwrap();
+        let content = rendered
+            .bgra
+            .chunks_exact(4)
+            .filter(|px| px[3] != 0 && *px != &[255, 255, 255, 255])
+            .count() as f64
+            / (rendered.width as f64 * rendered.height as f64)
+            * 100.0;
+        assert!(
+            content < 3.0,
+            "phantom table borders painted: {content:.1}% content pixels"
+        );
+    }
+
     #[test]
     fn survives_real_world_urls_and_hits_inline_links() {
         // Modeled on Google's own mail: a protocol-relative webfont link plus
@@ -360,6 +463,9 @@ mod tests {
 </body>"#;
         let (rendered, hit) = render_email(html, 660, 2.0).unwrap();
         assert!(rendered.height > 0);
+        // Pixels actually painted (this test's fonts <link> used to leave the
+        // whole render transparent — and the old assertions never noticed).
+        assert!(transparent_pct(&rendered) < 1.0);
         // The plain inline link is clickable via glyph-level hit-testing.
         let found = scan_links(&hit, rendered.logical_width, rendered.logical_height);
         assert!(found.contains("https://example.com/check"), "found: {found:?}");
