@@ -56,10 +56,8 @@ blitz-html = "=0.3.0-beta.1"
 blitz-paint = "=0.3.0-beta.1"
 blitz-traits = "=0.3.0-beta.1"
 # Must match gpui's image version (RenderImage frames are image::Frame).
-# png enables the encoder for the gmail render-dump diagnostic.
+# png enables the encoder used by ext-gmail's local-server image test.
 image = { version = "0.25", default-features = false, features = ["png"] }
-# Bridge gpui's internal warn/error records into the gmail debug log.
-log = "0.4"
 # macOS Keychain storage for the Jira API token in release builds.
 security-framework = "2"
 

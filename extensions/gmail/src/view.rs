@@ -263,10 +263,6 @@ impl GmailView {
         }
         let uid = email.uid;
         let scale = window.scale_factor() as f64;
-        crate::debug_log(&format!(
-            "open uid={uid} cached={} scale={scale}",
-            cached_body(&self.account, uid).is_some()
-        ));
         // The auto-load setting makes every open behave as if "Load images"
         // was already pressed.
         let load_images = self.auto_load_images;
@@ -294,7 +290,6 @@ impl GmailView {
                         this.present_body(uid, body, scale, load_images, cx);
                     }
                     Err(e) => {
-                        crate::debug_log(&format!("fetch uid={uid}: FAILED: {e}"));
                         this.set_read_state(uid, ReadState::Failed(format!("Couldn't load message: {e}")));
                         cx.notify();
                     }
@@ -326,7 +321,6 @@ impl GmailView {
         reading.images_loaded = true;
         reading.state = ReadState::Loading;
         let scale = window.scale_factor() as f64;
-        crate::debug_log(&format!("load images uid={uid}"));
         self.present_body(uid, body, scale, true, cx);
         cx.notify();
     }
@@ -365,26 +359,18 @@ impl GmailView {
                                     logical_w: r.logical_width,
                                     logical_h: r.logical_height,
                                 },
-                                None => {
-                                    crate::debug_log(&format!(
-                                        "present uid={uid}: buffer size mismatch, falling back"
-                                    ));
-                                    text_or_failed(text_fallback)
-                                }
+                                None => text_or_failed(text_fallback),
                             }
                         }
                         Err(_) => text_or_failed(text_fallback),
                     };
-                    crate::debug_log(&format!("state uid={uid} -> {}", state_name(&state)));
                     this.set_read_state(uid, state);
                     cx.notify();
                 });
             })
             .detach();
         } else {
-            let state = text_or_failed(text_fallback);
-            crate::debug_log(&format!("state uid={uid} (no html) -> {}", state_name(&state)));
-            self.set_read_state(uid, state);
+            self.set_read_state(uid, text_or_failed(text_fallback));
         }
         cx.notify();
     }
@@ -703,17 +689,10 @@ impl GmailView {
                             .h(px(*logical_h)),
                     )
                     // Capture the card's painted bounds each frame so clicks can
-                    // be mapped from window space into document space. Log when
-                    // the size changes — i.e. once per open — as proof the card
-                    // actually laid out.
+                    // be mapped from window space into document space.
                     .child(
                         canvas(
-                            move |bounds, _, _| {
-                                if bounds_cell.get().size != bounds.size {
-                                    crate::debug_log(&format!("card painted at {bounds:?}"));
-                                }
-                                bounds_cell.set(bounds)
-                            },
+                            move |bounds, _, _| bounds_cell.set(bounds),
                             |_, _, _, _| {},
                         )
                         .absolute()
@@ -842,15 +821,6 @@ impl Render for GmailView {
 fn fill_snippet(email: &mut Email, body: &MailBody) {
     if let Some(text) = &body.text {
         email.snippet = models::snippet_of(text);
-    }
-}
-
-fn state_name(state: &ReadState) -> String {
-    match state {
-        ReadState::Loading => "Loading".to_string(),
-        ReadState::Html { logical_w, logical_h, .. } => format!("Html({logical_w}x{logical_h})"),
-        ReadState::Text(t) => format!("Text({}B)", t.len()),
-        ReadState::Failed(msg) => format!("Failed({msg})"),
     }
 }
 

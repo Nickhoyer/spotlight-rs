@@ -2009,13 +2009,13 @@ dependencies = [
  "gpui",
  "image",
  "imap",
- "log",
  "mail-parser",
  "native-tls",
  "serde",
  "serde_json",
  "spotlight-config",
  "spotlight-ui",
+ "ureq",
 ]
 
 [[package]]

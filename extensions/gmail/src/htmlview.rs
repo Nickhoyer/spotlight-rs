@@ -103,20 +103,6 @@ pub fn render_email(
     std::thread::Builder::new()
         .name("gmail-htmlview".to_string())
         .spawn(move || {
-            crate::debug_log(&format!(
-                "render: start {}B html at {logical_width}px @{scale}x",
-                html.len()
-            ));
-            // With the dump knob on, also save the exact source we're about
-            // to render so a transparent output can be reproduced offline.
-            if std::env::var_os("SPOTLIGHT_GMAIL_DUMP_RENDER").is_some() {
-                let path = spotlight_config::cache_dir().join("gmail-render-source.html");
-                match std::fs::write(&path, &html) {
-                    Ok(()) => crate::debug_log(&format!("render: source dumped to {}", path.display())),
-                    Err(e) => crate::debug_log(&format!("render: source dump failed: {e}")),
-                }
-            }
-            let started = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 build_and_render(&html, logical_width, scale, load_images)
             }))
@@ -128,20 +114,6 @@ pub fn render_email(
                     .unwrap_or("renderer panicked");
                 Err(anyhow!("HTML renderer failed: {msg}"))
             });
-            match &outcome {
-                Ok((_, r, _)) => crate::debug_log(&format!(
-                    "render: ok {}x{} physical ({}x{} logical) in {}ms",
-                    r.width,
-                    r.height,
-                    r.logical_width,
-                    r.logical_height,
-                    started.elapsed().as_millis()
-                )),
-                Err(e) => crate::debug_log(&format!(
-                    "render: FAILED after {}ms: {e}",
-                    started.elapsed().as_millis()
-                )),
-            }
             match outcome {
                 Ok((mut document, rendered, boxes)) => {
                     if result_tx.send(Ok(rendered)).is_err() {
@@ -326,33 +298,6 @@ fn build_and_render(
         width,
         height,
     );
-
-    // Diagnostic: what did the rasterizer actually produce? ~100% transparent
-    // means vello painted nothing (the injected white page background didn't
-    // even land) — the classic symptom being a blank card in the UI while
-    // every pipeline stage reports success. ~100% white with no content means
-    // layout/paint ran but text didn't (e.g. font loading failure).
-    let sampled = bgra.chunks_exact(4).step_by(16);
-    let (mut total, mut transparent, mut white, mut content) = (0u64, 0u64, 0u64, 0u64);
-    for px in sampled {
-        total += 1;
-        match px {
-            [_, _, _, 0] => transparent += 1,
-            [255, 255, 255, 255] => white += 1,
-            _ => content += 1,
-        }
-    }
-    let pct = |n: u64| (n as f64 / total.max(1) as f64) * 100.0;
-    crate::debug_log(&format!(
-        "render: pixels {:.1}% transparent / {:.1}% white / {:.1}% content",
-        pct(transparent),
-        pct(white),
-        pct(content)
-    ));
-    if std::env::var_os("SPOTLIGHT_GMAIL_DUMP_RENDER").is_some() {
-        dump_render(&bgra, width, height);
-    }
-
     // RGBA (blitz) → BGRA (gpui RenderImage).
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -367,29 +312,6 @@ fn build_and_render(
         bgra,
     };
     Ok((document, rendered, boxes))
-}
-
-/// Diagnostic (`SPOTLIGHT_GMAIL_DUMP_RENDER=1`): write the still-RGBA render
-/// to `<cache>/gmail-render-<WxH>.png` so a suspect image can be inspected
-/// directly. The png codec comes in via the workspace `image` features.
-fn dump_render(rgba: &[u8], width: u32, height: u32) {
-    use image::ImageEncoder as _;
-    let path = spotlight_config::cache_dir().join(format!("gmail-render-{width}x{height}.png"));
-    let _ = std::fs::create_dir_all(spotlight_config::cache_dir());
-    let encode = || -> anyhow::Result<()> {
-        let file = std::fs::File::create(&path)?;
-        image::codecs::png::PngEncoder::new(std::io::BufWriter::new(file)).write_image(
-            rgba,
-            width,
-            height,
-            image::ExtendedColorType::Rgba8,
-        )?;
-        Ok(())
-    };
-    match encode() {
-        Ok(()) => crate::debug_log(&format!("render: dumped {}", path.display())),
-        Err(e) => crate::debug_log(&format!("render: dump failed: {e}")),
-    }
 }
 
 /// Resolve a click to a link. Primary path: blitz's own hit-testing, which is

@@ -116,10 +116,8 @@ impl GmailClient {
     pub fn fetch_body(&self, uid: u32) -> Result<MailBody> {
         let fetches = self.with_session(|s| s.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])"))?;
         let Some(raw) = fetches.iter().find_map(|f| f.body()) else {
-            crate::debug_log(&format!("fetch_body uid={uid}: no body in FETCH response"));
             bail!("Gmail returned no body for message {uid}");
         };
-        crate::debug_log(&format!("fetch_body uid={uid}: raw {}B", raw.len()));
         body_from_raw(raw, uid)
     }
 }
@@ -137,11 +135,6 @@ fn body_from_raw(raw: &[u8], uid: u32) -> Result<MailBody> {
         .map(|s| s.into_owned())
         .filter(|t| !t.trim().is_empty())
         .or_else(|| html.as_deref().map(models::strip_html));
-    crate::debug_log(&format!(
-        "parse uid={uid}: html={} text={}",
-        html.as_ref().map(|h| format!("{}B", h.len())).unwrap_or_else(|| "none".into()),
-        text.as_ref().map(|t| format!("{}B", t.len())).unwrap_or_else(|| "none".into()),
-    ));
     Ok(MailBody { html, text })
 }
 
