@@ -390,6 +390,10 @@ impl SpotlightView {
         self.screen = Screen::Home;
         self.query.clear();
         self.results.clear();
+        // The ghost belongs to the query we just dropped. Left behind it renders
+        // alongside the placeholder on Home, and Tab would accept it.
+        self.ghost.clear();
+        self.ac_task = None;
         self.selected = 0;
         self.reset_home_sel();
         window.focus(&self.focus_handle, cx);
