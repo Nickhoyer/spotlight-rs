@@ -27,7 +27,7 @@ use futures::executor::block_on;
 use gpui::prelude::*;
 use gpui::{
     div, ease_in_out, img, linear, point, px, size, Animation, AnimationExt as _, AnyElement, AnyView,
-    App, Bounds, ClipboardItem, Context, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
+    App, Bounds, ClipboardItem, Context, FocusHandle, ImageSource, KeyDownEvent, KeyUpEvent, MouseButton,
     MouseDownEvent, ObjectFit, RenderImage, Window, WindowBackgroundAppearance, WindowBounds,
     WindowHandle, WindowKind, WindowOptions,
 };
@@ -45,6 +45,10 @@ const MIN_AC_LEN: usize = 2;
 /// Debounce before firing an autocomplete request, so mid-word keystrokes don't
 /// each spawn a call.
 const AC_DEBOUNCE_MS: u64 = 250;
+
+/// How long Escape must be held before it collapses the whole navigation stack
+/// straight back to Home, instead of tapping it once per level.
+const ESCAPE_HOLD_MS: u64 = 500;
 
 /// CoreGraphics window number of the launcher window, published once the window
 /// exists so the debug capture thread (see [`run`]) can grab it. Zero until set.
@@ -224,6 +228,11 @@ pub struct SpotlightView {
     /// Held so a re-summon mid-exit can cancel it (dropping the task) and reveal
     /// again instead of vanishing.
     exit_task: Option<gpui::Task<()>>,
+    /// Pending "hold-Escape collapses the whole stack back to Home" timer. Armed
+    /// on a fresh Escape press (on a screen with somewhere to go back to) and
+    /// dropped — cancelling it — the moment Escape is released, so only a
+    /// sustained hold fires it. See [`SpotlightView::on_escape_capture`].
+    escape_hold: Option<gpui::Task<()>>,
     /// Current rendered panel height, eased toward the active screen's target
     /// height each frame (`None` until the first render snaps it to target).
     cur_h: Option<f32>,
@@ -306,6 +315,7 @@ impl SpotlightView {
             reveal_start: Instant::now(),
             exiting: false,
             exit_task: None,
+            escape_hold: None,
             cur_h: None,
             cur_w: None,
             last_frame: Instant::now(),
@@ -878,6 +888,51 @@ impl SpotlightView {
                 // reveal onto the hidden surface, which then flashes on reopen.
             });
         }));
+    }
+
+    /// Capture-phase Escape handler powering hold-to-close. It runs on the shell
+    /// root *before* the event descends to whichever view is focused, so it sees
+    /// the key even on screens (like the mail reading pane) whose own handler
+    /// consumes Escape before it could bubble back up here.
+    ///
+    /// A fresh press arms a timer and then falls through untouched, so a plain
+    /// tap still does its usual one-level back-out (in the bubble handlers). The
+    /// auto-repeats macOS sends while the key stays down are swallowed here so
+    /// those per-level handlers don't fire once per repeat; if the key is still
+    /// held when the timer elapses, the whole stack collapses to Home in one go.
+    fn on_escape_capture(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key != "escape" {
+            return;
+        }
+        if event.is_held {
+            // Swallow the hold's auto-repeats; the armed timer owns the gesture.
+            cx.stop_propagation();
+            return;
+        }
+        // Nothing to collapse from Home — a tap there already hides the panel.
+        if self.screen == Screen::Home {
+            return;
+        }
+        self.escape_hold = Some(cx.spawn_in(window, async move |weak, cx| {
+            cx.background_executor().timer(Duration::from_millis(ESCAPE_HOLD_MS)).await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                this.escape_hold = None;
+                this.go_home(window, cx);
+            });
+        }));
+    }
+
+    /// Releasing Escape cancels a pending hold-to-close, so a quick tap only ever
+    /// backs out one level.
+    fn on_escape_release(&mut self, event: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            self.escape_hold = None;
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1561,6 +1616,11 @@ impl Render for SpotlightView {
         div()
             .key_context("Spotlight")
             .track_focus(&self.focus_handle)
+            // Hold-to-close runs in the capture phase so it sees Escape (and its
+            // held repeats) even when a focused extension panel would otherwise
+            // consume it before it bubbled back to the shell.
+            .capture_key_down(cx.listener(Self::on_escape_capture))
+            .capture_key_up(cx.listener(Self::on_escape_release))
             .on_key_down(cx.listener(Self::on_key_down))
             // Set an explicit font + default text color on the root so all text
             // inherits a known-present family rather than relying on the default.
