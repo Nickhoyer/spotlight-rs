@@ -72,15 +72,26 @@ impl JiraClient {
         &self.auth
     }
 
-    /// One issue with its description and comments server-rendered to HTML
-    /// (`expand=renderedFields`), for the in-app reading pane.
+    /// The request behind [`issue_detail`](Self::issue_detail).
+    ///
+    /// `renderedFields` only carries entries for fields named in `fields`, so
+    /// anything missing from that list comes back empty however the `expand`
+    /// is written — which is exactly how the description silently rendered as
+    /// "No description" while comments came through.
+    fn detail_url(&self, key: &str) -> String {
+        format!(
+            "{}/rest/api/3/issue/{}?fields=summary,status,description,comment\
+             &expand=renderedFields",
+            self.base_url, key
+        )
+    }
+
+    /// One issue with its description and comments server-rendered to HTML,
+    /// for the in-app reading pane.
     pub fn issue_detail(&self, key: &str) -> Result<IssueDetail> {
         let resp: IssueDetailResponse = self
             .agent
-            .get(&format!(
-                "{}/rest/api/3/issue/{}?fields=summary,status,comment&expand=renderedFields",
-                self.base_url, key
-            ))
+            .get(&self.detail_url(key))
             .set("Authorization", &self.auth)
             .set("Accept", "application/json")
             .call()?
@@ -162,7 +173,19 @@ fn normalize_base(site: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_base;
+    use super::{normalize_base, JiraClient};
+
+    #[test]
+    fn detail_request_asks_for_every_rendered_field_it_reads() {
+        let url = JiraClient::new("acme", "me@example.com", "token").detail_url("SO-2522");
+        assert!(url.starts_with("https://acme.atlassian.net/rest/api/3/issue/SO-2522?"));
+        assert!(url.contains("expand=renderedFields"), "{url}");
+        // Every field the reading pane renders must be requested by name —
+        // an unlisted field comes back empty rather than erroring.
+        for field in ["summary", "status", "description", "comment"] {
+            assert!(url.contains(field), "{field} not requested: {url}");
+        }
+    }
 
     #[test]
     fn normalizes_site_forms() {

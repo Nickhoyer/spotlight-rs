@@ -216,6 +216,12 @@ impl UreqNetProvider {
         Self {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
+                // The same-origin check below only sees the URL the document
+                // asked for, and hosts redirect: a Jira attachment bounces to
+                // api.media.atlassian.com. Stated explicitly (it is also
+                // ureq's default) so the credential can't follow a redirect
+                // off-origin if that default ever moves.
+                .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
                 .build(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             auth,
@@ -560,6 +566,37 @@ mod tests {
         (port, requests)
     }
 
+    /// A server that 302s every request to `location`, recording what it saw.
+    fn redirect_server(location: String) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let location = location.clone();
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        (port, requests)
+    }
+
     fn red_pixels(r: &super::RenderedHtml) -> usize {
         r.bgra
             .chunks_exact(4)
@@ -655,6 +692,43 @@ mod tests {
             !other.contains("Authorization"),
             "auth leaked cross-origin: {other}"
         );
+    }
+
+    #[test]
+    fn auth_does_not_follow_a_cross_origin_redirect() {
+        // Real shape: a Jira attachment is same-origin, so it gets the header,
+        // but Jira 302s it to api.media.atlassian.com. The credential must not
+        // make that hop — the destination is pre-signed and needs no auth.
+        let (dest_port, dest_requests) = png_server();
+        let (base_port, base_requests) =
+            redirect_server(format!("http://127.0.0.1:{dest_port}/signed.png"));
+
+        let (rendered, _) = render_html(
+            r#"<img src="/attachment/1" width="20" height="20">"#,
+            RenderOptions {
+                logical_width: 200,
+                scale: 1.0,
+                load_images: true,
+                base_url: format!("http://127.0.0.1:{base_port}/"),
+                auth: Some("Basic c2VjcmV0".to_string()),
+                scheme: Scheme::Light,
+            },
+        )
+        .unwrap();
+
+        let base = base_requests.lock().unwrap().join("\n");
+        let dest = dest_requests.lock().unwrap().join("\n");
+        assert!(
+            base.contains("Authorization: Basic c2VjcmV0"),
+            "same-origin request lacked auth: {base}"
+        );
+        assert!(!dest.is_empty(), "redirect was not followed");
+        assert!(
+            !dest.contains("Authorization"),
+            "auth followed the redirect off-origin: {dest}"
+        );
+        // The redirect was still followed to a real image.
+        assert!(red_pixels(&rendered) > 100, "redirected image did not render");
     }
 
     #[test]
