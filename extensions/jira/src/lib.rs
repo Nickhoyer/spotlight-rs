@@ -5,7 +5,9 @@
 //! [`SettingsTabFactory`] (a "Jira" tab). `app` registers both.
 
 mod client;
+mod copy;
 mod document;
+mod markdown;
 mod models;
 mod search;
 mod settings_tab;

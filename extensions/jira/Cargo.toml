@@ -17,3 +17,4 @@ spotlight-htmlview.workspace = true
 spotlight-core.workspace = true
 spotlight-config.workspace = true
 spotlight-ui.workspace = true
+spotlight-platform-macos.workspace = true

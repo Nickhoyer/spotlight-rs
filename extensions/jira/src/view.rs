@@ -23,6 +23,7 @@ use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
 use crate::client::JiraClient;
+use crate::copy;
 use crate::document::{self, DocStyle};
 use crate::models::{self, Account, Issue};
 use crate::JiraConfig;
@@ -78,6 +79,11 @@ struct Reading {
     summary: String,
     status: String,
     state: ReadState,
+    /// The fetched issue, kept so "Copy for Claude" can render Markdown
+    /// without refetching.
+    detail: Option<models::IssueDetail>,
+    /// Set briefly after a copy so the button can confirm it.
+    copied: bool,
 }
 
 /// State for the full-panel "Update status" transition picker.
@@ -397,6 +403,8 @@ impl JiraView {
             summary: issue.summary.clone(),
             status: issue.status.clone(),
             state: ReadState::Loading,
+            detail: None,
+            copied: false,
         });
 
         let scale = window.scale_factor() as f64;
@@ -438,11 +446,12 @@ impl JiraView {
                         if let Some(reading) = this.reading.as_mut() {
                             if reading.key == detail.key {
                                 if !detail.summary.is_empty() {
-                                    reading.summary = detail.summary;
+                                    reading.summary = detail.summary.clone();
                                 }
                                 if !detail.status.is_empty() {
-                                    reading.status = detail.status;
+                                    reading.status = detail.status.clone();
                                 }
+                                reading.detail = Some(detail.clone());
                             }
                         }
                         let state = match image::RgbaImage::from_raw(r.width, r.height, r.bgra)
@@ -525,6 +534,42 @@ impl JiraView {
         }
     }
 
+    /// Put the open issue on the clipboard as Markdown, people pseudonymized,
+    /// ready to paste into a chat. No-op until the fetch has landed.
+    fn copy_for_claude(&mut self, cx: &mut Context<Self>) {
+        let Some(reading) = self.reading.as_mut() else {
+            return;
+        };
+        let Some(detail) = reading.detail.clone() else {
+            return;
+        };
+        let url = self
+            .client
+            .as_ref()
+            .map(|c| c.browse_url(&detail.key))
+            .unwrap_or_default();
+        spotlight_platform_macos::clipboard::write_text(&copy::issue_markdown(&detail, &url));
+        reading.copied = true;
+        cx.notify();
+
+        // Let the confirmation fade back to the resting label.
+        let key = detail.key.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1600))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(reading) = this.reading.as_mut() {
+                    if reading.key == key {
+                        reading.copied = false;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn scroll_reading(&mut self, delta: f32) {
         let mut offset = self.read_scroll.offset();
         offset.y = px((f32::from(offset.y) + delta).min(0.0));
@@ -549,6 +594,7 @@ impl JiraView {
                     let key = reading.key.clone();
                     self.open_issue(&key);
                 }
+                "c" => self.copy_for_claude(cx),
                 _ => return,
             }
             cx.stop_propagation();
@@ -927,6 +973,10 @@ impl JiraView {
             return centered("");
         };
         let key = reading.key.clone();
+        // Copying needs the fetched issue, so the button only appears once it
+        // has landed.
+        let can_copy = reading.detail.is_some();
+        let copied = reading.copied;
         let byline = if reading.status.is_empty() {
             key.clone()
         } else {
@@ -973,6 +1023,33 @@ impl JiraView {
                     .child(div().text_xs().text_color(theme::muted()).child(byline))
                     .child(div().truncate().text_xl().text_color(theme::text()).child(summary)),
             )
+            .when(can_copy, |this| {
+                this.child(
+                    div()
+                        .id("jira-read-copy")
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .rounded_lg()
+                        .bg(if copied {
+                            theme::hover_strong()
+                        } else {
+                            theme::tile()
+                        })
+                        .hover(|s| s.bg(theme::hover_strong()))
+                        .text_xs()
+                        .text_color(theme::accent())
+                        .child(if copied {
+                            "Copied ✓"
+                        } else {
+                            "Copy for Claude"
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.copy_for_claude(cx)),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("jira-read-open")
@@ -1074,14 +1151,15 @@ impl JiraView {
             summary: "Demo issue".to_string(),
             status: "In Progress".to_string(),
             state: ReadState::Loading,
+            detail: None,
+            copied: false,
         });
         let detail = models::IssueDetail {
             key: "DEMO-1".to_string(),
             summary: "Demo issue".to_string(),
             status: "In Progress".to_string(),
             description_html: Some(html),
-            custom_fields: Vec::new(),
-            comments: Vec::new(),
+            ..Default::default()
         };
         let style = doc_style();
         let doc = document::issue_document(&detail, &style);

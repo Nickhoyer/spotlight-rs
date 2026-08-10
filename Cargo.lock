@@ -2027,6 +2027,7 @@ dependencies = [
  "spotlight-config",
  "spotlight-core",
  "spotlight-htmlview",
+ "spotlight-platform-macos",
  "spotlight-ui",
  "ureq",
 ]

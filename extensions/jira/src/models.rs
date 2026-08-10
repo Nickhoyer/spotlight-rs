@@ -83,6 +83,19 @@ pub struct DetailFields {
     pub status: Option<RawStatus>,
     #[serde(default)]
     pub comment: RawComments,
+    pub priority: Option<RawNamed>,
+    pub issuetype: Option<RawNamed>,
+    pub assignee: Option<RawAssignee>,
+    pub reporter: Option<RawAssignee>,
+    pub parent: Option<RawParent>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawParent {
+    #[serde(default)]
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -129,11 +142,19 @@ pub struct RenderedComment {
 }
 
 /// The cleaned-up detail the reading pane renders.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IssueDetail {
     pub key: String,
     pub summary: String,
     pub status: String,
+    /// Metadata the copy-for-LLM output carries; the reading pane's header
+    /// only needs the status.
+    pub issue_type: String,
+    pub priority: String,
+    pub assignee: Option<String>,
+    pub reporter: Option<String>,
+    pub parent_key: Option<String>,
+    pub labels: Vec<String>,
     pub description_html: Option<String>,
     /// Custom fields carrying rendered content ("Why we need this?",
     /// "Definition of Done"), labeled and ordered by display name.
@@ -211,6 +232,20 @@ impl IssueDetail {
                 .status
                 .map(|s| s.name)
                 .unwrap_or_default(),
+            issue_type: resp.fields.issuetype.map(|t| t.name).unwrap_or_default(),
+            priority: resp.fields.priority.map(|p| p.name).unwrap_or_default(),
+            assignee: resp
+                .fields
+                .assignee
+                .map(|a| a.display_name)
+                .filter(|n| !n.is_empty()),
+            reporter: resp
+                .fields
+                .reporter
+                .map(|a| a.display_name)
+                .filter(|n| !n.is_empty()),
+            parent_key: resp.fields.parent.map(|p| p.key).filter(|k| !k.is_empty()),
+            labels: resp.fields.labels,
             description_html: resp
                 .rendered
                 .description

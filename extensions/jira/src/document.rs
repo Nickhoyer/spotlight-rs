@@ -366,8 +366,8 @@ mod tests {
             summary: "Build the thing".into(),
             status: "In Progress".into(),
             description_html: description.map(str::to_string),
-            custom_fields: Vec::new(),
             comments,
+            ..Default::default()
         }
     }
 
