@@ -58,6 +58,188 @@ pub struct RawAssignee {
     pub account_id: String,
 }
 
+// ---- issue detail (rendered HTML) -----------------------------------------
+
+/// `GET /issue/{key}?expand=renderedFields` response. `renderedFields` holds
+/// the same fields as `fields` but with Atlassian-Document-Format bodies
+/// server-rendered to HTML strings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueDetailResponse {
+    #[serde(default)]
+    pub fields: DetailFields,
+    #[serde(rename = "renderedFields", default)]
+    pub rendered: RenderedDetailFields,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DetailFields {
+    #[serde(default)]
+    pub summary: String,
+    pub status: Option<RawStatus>,
+    #[serde(default)]
+    pub comment: RawComments,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RenderedDetailFields {
+    /// Description as HTML (`null` for issues without one).
+    pub description: Option<String>,
+    #[serde(default)]
+    pub comment: RenderedComments,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RawComments {
+    #[serde(default)]
+    pub comments: Vec<RawComment>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RawComment {
+    pub author: Option<RawAssignee>,
+    #[serde(default)]
+    pub created: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RenderedComments {
+    #[serde(default)]
+    pub comments: Vec<RenderedComment>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RenderedComment {
+    /// Comment body as HTML.
+    #[serde(default)]
+    pub body: String,
+    /// Human-formatted date, e.g. `07/Aug/26 9:15 AM`.
+    #[serde(default)]
+    pub created: String,
+}
+
+/// The cleaned-up detail the reading pane renders.
+#[derive(Debug, Clone)]
+pub struct IssueDetail {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    pub description_html: Option<String>,
+    pub comments: Vec<CommentHtml>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentHtml {
+    pub author: String,
+    pub created: String,
+    pub body_html: String,
+}
+
+impl IssueDetail {
+    pub fn from_raw(key: String, resp: IssueDetailResponse) -> Self {
+        // Rendered comments carry the HTML body and a human-formatted date;
+        // authors come from the plain fields, zipped by index.
+        let comments = resp
+            .rendered
+            .comment
+            .comments
+            .into_iter()
+            .enumerate()
+            .map(|(i, rendered)| {
+                let raw = resp.fields.comment.comments.get(i);
+                CommentHtml {
+                    author: raw
+                        .and_then(|c| c.author.as_ref())
+                        .map(|a| a.display_name.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    created: if rendered.created.is_empty() {
+                        raw.map(|c| c.created.clone()).unwrap_or_default()
+                    } else {
+                        rendered.created
+                    },
+                    body_html: rendered.body,
+                }
+            })
+            .collect();
+        IssueDetail {
+            key,
+            summary: resp.fields.summary,
+            status: resp
+                .fields
+                .status
+                .map(|s| s.name)
+                .unwrap_or_default(),
+            description_html: resp
+                .rendered
+                .description
+                .filter(|d| !d.trim().is_empty()),
+            comments,
+        }
+    }
+}
+
+/// HTML-escape a text fragment interpolated into [`issue_document`].
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Compose one HTML document from an issue's rendered description + comments,
+/// for the shared Blitz renderer. Jira's rendered fields are bare semantic
+/// HTML with class hooks but no styles, so a small stylesheet approximating
+/// Jira's own look is prepended (the renderer paints on white).
+pub fn issue_document(detail: &IssueDetail) -> String {
+    let mut doc = String::from(
+        "<style>\
+         body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;\
+                font-size: 14px; line-height: 1.55; color: #172b4d; }\
+         h1,h2,h3,h4 { line-height: 1.3; }\
+         a { color: #0052cc; }\
+         img { max-width: 100%; }\
+         code, pre, tt { font-family: Menlo, Monaco, monospace; font-size: 12px;\
+                         background: #f4f5f7; border-radius: 3px; }\
+         pre { padding: 8px 12px; }\
+         blockquote { border-left: 2px solid #dfe1e6; margin-left: 0;\
+                      padding-left: 12px; color: #5e6c84; }\
+         table { border-collapse: separate; }\
+         th, td { border: 1px solid #dfe1e6; padding: 4px 8px; }\
+         hr { border: none; border-top: 1px solid #dfe1e6; margin: 20px 0; }\
+         .meta { font-size: 12px; color: #5e6c84; margin: 16px 0 4px; }\
+         .empty { color: #5e6c84; font-style: italic; }\
+         </style>",
+    );
+    match &detail.description_html {
+        Some(html) => doc.push_str(html),
+        None => doc.push_str("<p class=\"empty\">No description.</p>"),
+    }
+    if !detail.comments.is_empty() {
+        doc.push_str("<hr>");
+        let n = detail.comments.len();
+        doc.push_str(&format!(
+            "<div class=\"meta\"><b>{n} comment{}</b></div>",
+            if n == 1 { "" } else { "s" }
+        ));
+        for comment in &detail.comments {
+            doc.push_str(&format!(
+                "<div class=\"meta\"><b>{}</b> · {}</div>{}",
+                escape_html(&comment.author),
+                escape_html(&comment.created),
+                comment.body_html
+            ));
+        }
+    }
+    doc
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Account {
     #[serde(rename = "accountId", default)]
@@ -279,6 +461,50 @@ mod tests {
                 "Done",
             ]
         );
+    }
+
+    #[test]
+    fn parses_issue_detail_and_composes_document() {
+        let json = r#"{
+            "key": "FE-42",
+            "fields": {
+                "summary": "Build the thing",
+                "status": { "name": "In Progress", "statusCategory": { "colorName": "yellow" } },
+                "comment": { "comments": [
+                    { "author": { "displayName": "Jane <Dev>", "accountId": "a1" }, "created": "2026-08-07T09:15:00.000+0200" }
+                ]}
+            },
+            "renderedFields": {
+                "description": "<p>Do the <b>thing</b></p>",
+                "comment": { "comments": [
+                    { "body": "<p>On it.</p>", "created": "07/Aug/26 9:15 AM" }
+                ]}
+            }
+        }"#;
+        let resp: IssueDetailResponse = serde_json::from_str(json).unwrap();
+        let detail = IssueDetail::from_raw("FE-42".into(), resp);
+        assert_eq!(detail.summary, "Build the thing");
+        assert_eq!(detail.status, "In Progress");
+        assert_eq!(detail.description_html.as_deref(), Some("<p>Do the <b>thing</b></p>"));
+        assert_eq!(detail.comments.len(), 1);
+
+        let doc = issue_document(&detail);
+        assert!(doc.contains("<p>Do the <b>thing</b></p>"));
+        // Author names are escaped; rendered bodies pass through as-is.
+        assert!(doc.contains("Jane &lt;Dev&gt;"));
+        assert!(doc.contains("<p>On it.</p>"));
+        assert!(doc.contains("07/Aug/26 9:15 AM"));
+    }
+
+    #[test]
+    fn issue_document_without_description_or_comments() {
+        let json = r#"{ "key": "X-1", "fields": {}, "renderedFields": { "description": "  " } }"#;
+        let resp: IssueDetailResponse = serde_json::from_str(json).unwrap();
+        let detail = IssueDetail::from_raw("X-1".into(), resp);
+        assert!(detail.description_html.is_none());
+        let doc = issue_document(&detail);
+        assert!(doc.contains("No description."));
+        assert!(!doc.contains("comment"));
     }
 
     #[test]

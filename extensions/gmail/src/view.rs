@@ -20,8 +20,9 @@ use gpui::{
 use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
+use spotlight_htmlview::{HitTester, RenderOptions};
+
 use crate::client::{GmailClient, InboxFilter, INBOX_URL};
-use crate::htmlview::{self, HitTester};
 use crate::models::{self, Email, Inbox, MailBody};
 
 /// Logical width the email body renders at: the panel's content width (the
@@ -368,7 +369,21 @@ impl GmailView {
             cx.spawn(async move |this, cx| {
                 let rendered = cx
                     .background_executor()
-                    .spawn(async move { htmlview::render_email(&html, width, scale, load_images) })
+                    .spawn(async move {
+                        spotlight_htmlview::render_html(
+                            &html,
+                            RenderOptions {
+                                logical_width: width,
+                                scale,
+                                load_images,
+                                // Real emails are full of relative and
+                                // protocol-relative URLs; resolution just must
+                                // not fail (nothing is fetched without opt-in).
+                                base_url: "https://mail.google.com/".to_string(),
+                                auth: None,
+                            },
+                        )
+                    })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let state = match rendered {

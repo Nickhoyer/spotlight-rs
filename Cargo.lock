@@ -2000,12 +2000,6 @@ name = "ext-gmail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "anyrender",
- "anyrender_vello_cpu",
- "blitz-dom",
- "blitz-html",
- "blitz-paint",
- "blitz-traits",
  "gpui",
  "image",
  "imap",
@@ -2014,6 +2008,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spotlight-config",
+ "spotlight-htmlview",
  "spotlight-ui",
  "ureq",
 ]
@@ -2026,10 +2021,12 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "gpui",
+ "image",
  "serde",
  "serde_json",
  "spotlight-config",
  "spotlight-core",
+ "spotlight-htmlview",
  "spotlight-ui",
  "ureq",
 ]
@@ -6074,6 +6071,22 @@ dependencies = [
  "async-trait",
  "futures",
  "nucleo-matcher",
+]
+
+[[package]]
+name = "spotlight-htmlview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "anyrender",
+ "anyrender_vello_cpu",
+ "blitz-dom",
+ "blitz-html",
+ "blitz-paint",
+ "blitz-traits",
+ "image",
+ "ureq",
+ "url",
 ]
 
 [[package]]

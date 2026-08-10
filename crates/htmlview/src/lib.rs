@@ -1,8 +1,11 @@
-//! Headless HTML rendering for email bodies via Blitz (Servo's Stylo styles +
-//! Taffy layout + CPU Vello painting). No JavaScript, and by default no
-//! network provider — remote images and trackers are never fetched unless the
-//! user explicitly opts in per message (`load_images`), which grants http(s)
-//! GETs only.
+//! Headless HTML rendering via Blitz (Servo's Stylo styles + Taffy layout +
+//! CPU Vello painting), shared by extensions that show remote HTML in-app
+//! (Gmail message bodies, Jira issue descriptions). No JavaScript, and by
+//! default no network provider — remote images and trackers are never fetched
+//! unless the caller explicitly opts in (`load_images`), which grants http(s)
+//! GETs only. An optional `Authorization` header is sent with those GETs, and
+//! only to the `base_url` origin, so API credentials never leak to third-party
+//! image hosts.
 //!
 //! The document itself is `!Send`, so each render runs on its own named
 //! thread, which then stays alive serving click→link hit-tests over a channel
@@ -28,15 +31,27 @@ use blitz_traits::shell::{ColorScheme, Viewport};
 /// Cap on rendered document height in *physical* px. Metal refuses textures
 /// above 16384px, and gpui uploads the image as one texture — anything taller
 /// displays as nothing at all. Kept well under the limit; it also bounds CPU
-/// paint time for pathological newsletters. Anything longer is clipped.
+/// paint time for pathological documents. Anything longer is clipped.
 const MAX_PHYSICAL_HEIGHT: f64 = 12_000.0;
 
-/// Base URL for resolving the relative / protocol-relative URLs that real
-/// emails are full of (`//fonts.googleapis.com/...`, `cid:` images, bare
-/// paths). Without one, blitz's `resolve_url` panics on the first such href.
-/// Nothing is ever fetched — there is no net provider — resolution just must
-/// not fail.
-const BASE_URL: &str = "https://mail.google.com/";
+/// How to render a document. `base_url` must be set: real-world HTML is full
+/// of relative and protocol-relative URLs (`//fonts.googleapis.com/...`,
+/// `cid:` images, bare paths), and blitz's `resolve_url` panics on the first
+/// such href without a base. Nothing is fetched during resolution — it just
+/// must not fail.
+pub struct RenderOptions {
+    /// Logical (CSS-pixel) width to lay the document out at.
+    pub logical_width: u32,
+    /// Rasterization scale (the window's backing scale factor).
+    pub scale: f64,
+    /// Fetch remote http(s) images. Off = fully offline render.
+    pub load_images: bool,
+    /// Base URL for resolving relative URLs, e.g. `https://mail.google.com/`.
+    pub base_url: String,
+    /// `Authorization` header value sent with image fetches — but only to
+    /// requests on `base_url`'s origin (scheme + host + port).
+    pub auth: Option<String>,
+}
 
 /// An absolute link box in logical (CSS-pixel) document coordinates.
 #[derive(Debug, Clone)]
@@ -54,9 +69,9 @@ impl LinkBox {
     }
 }
 
-/// A rendered email body: straight-alpha BGRA pixels (gpui's `RenderImage`
+/// A rendered document: straight-alpha BGRA pixels (gpui's `RenderImage`
 /// byte order) plus the layout size to present them at.
-pub struct RenderedEmail {
+pub struct RenderedHtml {
     /// Physical pixel dimensions of `bgra`.
     pub width: u32,
     pub height: u32,
@@ -73,7 +88,8 @@ pub struct HitTester {
 }
 
 impl HitTester {
-    /// The href under logical document coordinates `(x, y)`, if any.
+    /// The href under logical document coordinates `(x, y)`, if any. Returned
+    /// as written in the document — relative hrefs stay relative.
     pub fn hit(&self, x: f32, y: f32) -> Option<String> {
         let (reply_tx, reply_rx) = channel();
         self.query.send((x, y, reply_tx)).ok()?;
@@ -81,30 +97,25 @@ impl HitTester {
     }
 }
 
-/// Render an HTML email body at `logical_width` CSS px wide, rasterized at
-/// `scale`× for the screen. Blocks until the first paint completes (callers
-/// run it on the background executor). With `load_images`, remote http(s)
-/// images are fetched (the only time this module touches the network) and
-/// the render waits — within a budget — for them to arrive.
+/// Render an HTML document per `opts`. Blocks until the first paint completes
+/// (callers run it on the background executor). With `load_images`, remote
+/// http(s) images are fetched (the only time this module touches the network)
+/// and the render waits — within a budget — for them to arrive.
 ///
 /// Blitz is young and panics on some malformed documents; panics on the
-/// render thread degrade to an error (→ the caller's text fallback) rather
-/// than poisoning the app.
-pub fn render_email(
-    html: &str,
-    logical_width: u32,
-    scale: f64,
-    load_images: bool,
-) -> Result<(RenderedEmail, HitTester)> {
+/// render thread degrade to an error (→ the caller's fallback) rather than
+/// poisoning the app.
+pub fn render_html(html: &str, opts: RenderOptions) -> Result<(RenderedHtml, HitTester)> {
     let (result_tx, result_rx) = channel();
     let (query_tx, query_rx) = channel::<(f32, f32, Sender<Option<String>>)>();
     let html = html.to_string();
+    let scale = opts.scale;
 
     std::thread::Builder::new()
-        .name("gmail-htmlview".to_string())
+        .name("htmlview".to_string())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_and_render(&html, logical_width, scale, load_images)
+                build_and_render(&html, &opts)
             }))
             .unwrap_or_else(|payload| {
                 let msg = payload
@@ -138,26 +149,29 @@ pub fn render_email(
 }
 
 /// Byte cap per fetched image, and overall wall-clock budget for loading a
-/// message's images before rendering proceeds with whatever has arrived.
+/// document's images before rendering proceeds with whatever has arrived.
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const IMAGE_LOAD_BUDGET: Duration = Duration::from_secs(12);
 
-/// A blocking, thread-per-request network provider used only when the user
-/// explicitly asks to load a message's remote images. GET over http(s) only;
+/// A blocking, thread-per-request network provider used only when the caller
+/// explicitly asks to load a document's remote images. GET over http(s) only;
 /// anything else (cid:, data:, form posts) is dropped, which blitz treats as
 /// a resource that simply never arrives.
 struct UreqNetProvider {
     agent: ureq::Agent,
     in_flight: Arc<AtomicUsize>,
+    /// `Authorization` value sent only to requests matching this origin.
+    auth: Option<(url::Origin, String)>,
 }
 
 impl UreqNetProvider {
-    fn new() -> Self {
+    fn new(auth: Option<(url::Origin, String)>) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
                 .build(),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            auth,
         }
     }
 
@@ -176,8 +190,19 @@ impl NetProvider for UreqNetProvider {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let agent = self.agent.clone();
         let in_flight = self.in_flight.clone();
+        // Same-origin only: never hand the API credential to third-party hosts
+        // an author might have linked images from.
+        let auth = self
+            .auth
+            .as_ref()
+            .filter(|(origin, _)| request.url.origin() == *origin)
+            .map(|(_, header)| header.clone());
         std::thread::spawn(move || {
-            let result = agent.get(request.url.as_str()).call();
+            let mut req = agent.get(request.url.as_str());
+            if let Some(auth) = &auth {
+                req = req.set("Authorization", auth);
+            }
+            let result = req.call();
             if let Ok(response) = result {
                 let mut buf = Vec::new();
                 use std::io::Read as _;
@@ -196,11 +221,12 @@ impl NetProvider for UreqNetProvider {
 }
 
 /// Remove external-stylesheet references (`<link …>` tags and `@import`
-/// rules) before parsing. There is no net provider, so they could never load
-/// — and blitz suppresses ALL painting while such "critical resources" are
-/// pending, which turned every email with a webfont/stylesheet link into a
-/// fully transparent render. Emails lose nothing: without network, a `<link>`
-/// can't contribute styles anyway (and not fetching is the privacy point).
+/// rules) before parsing. Stylesheets are never fetched (only images are,
+/// and only on opt-in) — and blitz suppresses ALL painting while such
+/// "critical resources" are pending, which turned every email with a
+/// webfont/stylesheet link into a fully transparent render. Documents lose
+/// nothing: an unfetched `<link>` can't contribute styles anyway (and not
+/// fetching is the privacy point).
 fn sanitize(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
@@ -235,11 +261,9 @@ fn sanitize(html: &str) -> String {
 
 fn build_and_render(
     html: &str,
-    logical_width: u32,
-    scale: f64,
-    load_images: bool,
-) -> Result<(HtmlDocument, RenderedEmail, Vec<LinkBox>)> {
-    // Emails render on white regardless of app theme; inject a base style
+    opts: &RenderOptions,
+) -> Result<(HtmlDocument, RenderedHtml, Vec<LinkBox>)> {
+    // Documents render on white regardless of app theme; inject a base style
     // (author styles still override the backgrounds). The border-collapse
     // override neutralizes a blitz bug where `border-collapse: collapse` —
     // boilerplate in email CSS resets, both in stylesheets and inline on
@@ -253,17 +277,22 @@ fn build_and_render(
          </style>{}",
         sanitize(html)
     );
+    let scale = opts.scale;
 
-    let provider = load_images.then(|| Arc::new(UreqNetProvider::new()));
+    let auth = opts.auth.clone().and_then(|header| {
+        let origin = url::Url::parse(&opts.base_url).ok()?.origin();
+        Some((origin, header))
+    });
+    let provider = opts.load_images.then(|| Arc::new(UreqNetProvider::new(auth)));
     let mut document = HtmlDocument::from_html(
         &html,
         DocumentConfig {
-            base_url: Some(BASE_URL.to_string()),
+            base_url: Some(opts.base_url.clone()),
             net_provider: provider
                 .clone()
                 .map(|p| p as Arc<dyn NetProvider>),
             viewport: Some(Viewport::new(
-                logical_width * (scale as u32),
+                opts.logical_width * (scale as u32),
                 800 * (scale as u32),
                 scale as f32,
                 ColorScheme::Light,
@@ -287,7 +316,7 @@ fn build_and_render(
 
     let content_height = document.as_ref().root_element().final_layout.size.height;
     let logical_height = (content_height as f64).clamp(24.0, MAX_PHYSICAL_HEIGHT / scale);
-    let width = (logical_width as f64 * scale) as u32;
+    let width = (opts.logical_width as f64 * scale) as u32;
     let height = (logical_height * scale) as u32;
     if width == 0 || height == 0 {
         bail!("empty render");
@@ -304,10 +333,10 @@ fn build_and_render(
     }
 
     let boxes = collect_links(document.as_ref());
-    let rendered = RenderedEmail {
+    let rendered = RenderedHtml {
         width,
         height,
-        logical_width: logical_width as f32,
+        logical_width: opts.logical_width as f32,
         logical_height: logical_height as f32,
         bgra,
     };
@@ -382,8 +411,19 @@ fn collect_links(doc: &BaseDocument) -> Vec<LinkBox> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_email;
+    use super::{render_html, RenderOptions};
     use std::collections::HashSet;
+
+    /// Options matching the old Gmail defaults the tests were written against.
+    fn opts(logical_width: u32, scale: f64, load_images: bool) -> RenderOptions {
+        RenderOptions {
+            logical_width,
+            scale,
+            load_images,
+            base_url: "https://mail.google.com/".to_string(),
+            auth: None,
+        }
+    }
 
     /// Sweep a coordinate grid over the document and collect every href the
     /// hit-tester resolves.
@@ -404,8 +444,8 @@ mod tests {
     }
 
     /// Fraction of pixels that are fully transparent — the signature of
-    /// blitz's suppressed paint. A healthy email render is ~0%.
-    fn transparent_pct(rendered: &super::RenderedEmail) -> f64 {
+    /// blitz's suppressed paint. A healthy render is ~0%.
+    fn transparent_pct(rendered: &super::RenderedHtml) -> f64 {
         let transparent = rendered
             .bgra
             .chunks_exact(4)
@@ -425,7 +465,7 @@ mod tests {
 <link href="https://fonts.googleapis.com/css?family=Lato:400,700" rel="stylesheet" type="text/css">
 <style>@import url("https://example.com/more.css"); .x { color: #333; }</style>
 </head><body style="background-color:#fff"><p class="x">Hola mundo</p></body></html>"#;
-        let (rendered, _hit) = render_email(html, 660, 2.0, false).unwrap();
+        let (rendered, _hit) = render_html(html, opts(660, 2.0, false)).unwrap();
         assert!(
             transparent_pct(&rendered) < 1.0,
             "paint was suppressed: {:.1}% transparent",
@@ -433,25 +473,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn loads_images_from_local_server_only_when_asked() {
+    /// A throwaway local HTTP server that serves one red 8x8 PNG to every
+    /// request and records each request's raw header block.
+    fn png_server() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use image::ImageEncoder as _;
         use std::io::{Read as _, Write as _};
 
-        // A throwaway local server offering one red 8x8 PNG.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut png = Vec::new();
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(&[255u8, 0, 0, 255].repeat(64), 8, 8, image::ExtendedColorType::Rgba8)
             .unwrap();
+        let seen = requests.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let png = png.clone();
+                let seen = seen.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf);
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
                     let header = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         png.len()
@@ -461,24 +507,66 @@ mod tests {
                 });
             }
         });
+        (port, requests)
+    }
 
+    fn red_pixels(r: &super::RenderedHtml) -> usize {
+        r.bgra
+            .chunks_exact(4)
+            .filter(|p| p[2] > 200 && p[1] < 60 && p[0] < 60 && p[3] == 255)
+            .count()
+    }
+
+    #[test]
+    fn loads_images_from_local_server_only_when_asked() {
+        let (port, _requests) = png_server();
         let html =
             format!(r#"<img src="http://127.0.0.1:{port}/img.png" width="100" height="100">"#);
-        let red_pixels = |r: &super::RenderedEmail| {
-            r.bgra
-                .chunks_exact(4)
-                .filter(|p| p[2] > 200 && p[1] < 60 && p[0] < 60 && p[3] == 255)
-                .count()
-        };
 
-        let (blocked, _) = render_email(&html, 400, 1.0, false).unwrap();
+        let (blocked, _) = render_html(&html, opts(400, 1.0, false)).unwrap();
         assert_eq!(red_pixels(&blocked), 0, "images fetched without opt-in");
 
-        let (loaded, _) = render_email(&html, 400, 1.0, true).unwrap();
+        let (loaded, _) = render_html(&html, opts(400, 1.0, true)).unwrap();
         assert!(
             red_pixels(&loaded) > 1000,
             "image did not render: {} red pixels",
             red_pixels(&loaded)
+        );
+    }
+
+    #[test]
+    fn auth_header_stays_on_base_origin() {
+        // Two servers = two origins. The image on the base origin gets the
+        // Authorization header; the cross-origin one must not see it.
+        let (same_port, same_requests) = png_server();
+        let (other_port, other_requests) = png_server();
+        let html = format!(
+            r#"<img src="/a.png" width="20" height="20">
+               <img src="http://127.0.0.1:{other_port}/b.png" width="20" height="20">"#
+        );
+        let (rendered, _) = render_html(
+            &html,
+            RenderOptions {
+                logical_width: 400,
+                scale: 1.0,
+                load_images: true,
+                base_url: format!("http://127.0.0.1:{same_port}/"),
+                auth: Some("Basic c2VjcmV0".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(red_pixels(&rendered) > 500, "images did not render");
+
+        let same = same_requests.lock().unwrap().join("\n");
+        let other = other_requests.lock().unwrap().join("\n");
+        assert!(
+            same.contains("Authorization: Basic c2VjcmV0"),
+            "same-origin fetch lacked auth: {same}"
+        );
+        assert!(!other.is_empty(), "cross-origin image was never fetched");
+        assert!(
+            !other.contains("Authorization"),
+            "auth leaked cross-origin: {other}"
         );
     }
 
@@ -494,7 +582,7 @@ mod tests {
 <td align="center"><img src="https://cdn.example.net/logo.png" alt="Logo" width="493" style="width:85%"></td>
 </tr></tbody></table>
 </body></html>"#;
-        let (rendered, _hit) = render_email(html, 660, 2.0, false).unwrap();
+        let (rendered, _hit) = render_html(html, opts(660, 2.0, false)).unwrap();
         let content = rendered
             .bgra
             .chunks_exact(4)
@@ -520,7 +608,7 @@ mod tests {
   <img src="images/footer.png" width="10" height="10">
   <p style="font-family:'Google Sans',Roboto,Arial;">A new sign-in — <a href="https://example.com/check">check activity</a>.</p>
 </body>"#;
-        let (rendered, hit) = render_email(html, 660, 2.0, false).unwrap();
+        let (rendered, hit) = render_html(html, opts(660, 2.0, false)).unwrap();
         assert!(rendered.height > 0);
         // Pixels actually painted (this test's fonts <link> used to leave the
         // whole render transparent — and the old assertions never noticed).
@@ -539,7 +627,7 @@ mod tests {
 
     #[test]
     fn renders_and_hits_button_links() {
-        let (rendered, hit) = render_email(BUTTON_EMAIL, 660, 2.0, false).unwrap();
+        let (rendered, hit) = render_html(BUTTON_EMAIL, opts(660, 2.0, false)).unwrap();
         assert_eq!(rendered.width, 1320);
         assert!(rendered.height > 100);
         assert_eq!(

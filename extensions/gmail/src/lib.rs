@@ -6,7 +6,6 @@
 //! [`SettingsTabFactory`] (a "Gmail" tab). `app` registers both.
 
 mod client;
-mod htmlview;
 mod models;
 mod settings_tab;
 mod view;

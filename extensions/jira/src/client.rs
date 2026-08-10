@@ -8,7 +8,10 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine as _;
 
-use crate::models::{Account, Issue, SearchResponse, Transition, TransitionsResponse};
+use crate::models::{
+    Account, Issue, IssueDetail, IssueDetailResponse, SearchResponse, Transition,
+    TransitionsResponse,
+};
 
 #[derive(Clone)]
 pub struct JiraClient {
@@ -56,6 +59,33 @@ impl JiraClient {
             .send_json(body)?
             .into_json()?;
         Ok(resp.issues.into_iter().map(Issue::from_raw).collect())
+    }
+
+    /// The site base URL, e.g. `https://acme.atlassian.net` (no trailing slash).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The `Authorization` header value, for the HTML renderer's same-origin
+    /// image fetches (issue attachments and avatars require auth).
+    pub fn auth_header(&self) -> &str {
+        &self.auth
+    }
+
+    /// One issue with its description and comments server-rendered to HTML
+    /// (`expand=renderedFields`), for the in-app reading pane.
+    pub fn issue_detail(&self, key: &str) -> Result<IssueDetail> {
+        let resp: IssueDetailResponse = self
+            .agent
+            .get(&format!(
+                "{}/rest/api/3/issue/{}?fields=summary,status,comment&expand=renderedFields",
+                self.base_url, key
+            ))
+            .set("Authorization", &self.auth)
+            .set("Accept", "application/json")
+            .call()?
+            .into_json()?;
+        Ok(IssueDetail::from_raw(key.to_string(), resp))
     }
 
     /// The authenticated user (for "Assign to me").

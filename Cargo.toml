@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/config",
     "crates/platform-macos",
+    "crates/htmlview",
     "crates/ui",
     "crates/app",
     "extensions/apps",
@@ -55,6 +56,9 @@ blitz-dom = "=0.3.0-beta.1"
 blitz-html = "=0.3.0-beta.1"
 blitz-paint = "=0.3.0-beta.1"
 blitz-traits = "=0.3.0-beta.1"
+# URL parsing (already in the tree via blitz): origin checks so the HTML
+# renderer only sends auth headers to the configured site.
+url = "2"
 # Must match gpui's image version (RenderImage frames are image::Frame).
 # png enables the encoder used by ext-gmail's local-server image test.
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -65,6 +69,7 @@ security-framework = "2"
 spotlight-core = { path = "crates/core" }
 spotlight-config = { path = "crates/config" }
 spotlight-platform-macos = { path = "crates/platform-macos" }
+spotlight-htmlview = { path = "crates/htmlview" }
 spotlight-ui = { path = "crates/ui" }
 ext-apps = { path = "extensions/apps" }
 ext-calculator = { path = "extensions/calculator" }

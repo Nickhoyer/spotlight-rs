@@ -1,17 +1,24 @@
 //! The Jira panel: filter chips, a stale-while-revalidate issue list with a
-//! "syncing" indicator, and per-row hover quick actions (Assign to me / Update
-//! status).
+//! "syncing" indicator, per-row hover quick actions (Assign to me / Update
+//! status), and a drill-in reading pane rendering the issue's description and
+//! comments — Jira's server-rendered HTML drawn in-app via Blitz (links stay
+//! clickable through the renderer's hit-testing). Escape/Left returns to the
+//! list; the browser is always one "Open in Jira ↗" away.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, ease_in_out, linear, px, rgb, rgba, AnyElement, Animation, AnimationExt as _, Context,
-    FocusHandle, MouseButton, Window,
+    canvas, div, ease_in_out, img, linear, px, rgb, rgba, AnyElement, Animation,
+    AnimationExt as _, Bounds, Context, FocusHandle, ImageSource, MouseButton, MouseDownEvent,
+    Pixels, Point, RenderImage, ScrollHandle, Window,
 };
 
 use spotlight_config::{AppConfig, Recent};
+use spotlight_htmlview::{HitTester, RenderOptions};
 use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
@@ -21,6 +28,35 @@ use crate::JiraConfig;
 
 /// Delay before hovering a row reveals its quick actions.
 const HOVER_REVEAL_MS: u64 = 500;
+
+/// Logical width the issue document renders at: the panel's content width (the
+/// panel is fixed-width; a small margin keeps the card off the panel edges).
+fn read_width() -> f32 {
+    spotlight_ui::extension_panel_width() - 32.0
+}
+
+/// Arrow-key scroll step in the reading pane.
+const SCROLL_STEP: f32 = 80.0;
+
+/// The drill-in reading pane's content state.
+enum ReadState {
+    Loading,
+    /// Blitz-rendered HTML: an image plus a live hit-tester for link clicks.
+    Html {
+        image: Arc<RenderImage>,
+        hit: HitTester,
+        logical_w: f32,
+        logical_h: f32,
+    },
+    Failed(String),
+}
+
+struct Reading {
+    key: String,
+    summary: String,
+    status: String,
+    state: ReadState,
+}
 
 /// State for the full-panel "Update status" transition picker.
 #[derive(Clone)]
@@ -43,6 +79,16 @@ pub struct JiraView {
     hovered: Option<usize>,
     revealed: Option<usize>,
     picker: Option<StatusPicker>,
+    /// Open issue, if any (list stays behind it).
+    reading: Option<Reading>,
+    /// Scroll state for the reading pane.
+    read_scroll: ScrollHandle,
+    /// Last-painted bounds of the rendered-HTML card, for click→link mapping.
+    body_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Debug aid: description HTML to open in the reading pane on first render
+    /// (`SPOTLIGHT_JIRA_DEMO_HTML=<path>`), for headless captures — rendered
+    /// without a configured client or network.
+    demo_html: Option<String>,
     /// Bumped on each fetch so out-of-order responses can be discarded.
     generation: u64,
     focus_handle: FocusHandle,
@@ -82,6 +128,12 @@ impl JiraView {
             hovered: None,
             revealed: None,
             picker: None,
+            reading: None,
+            read_scroll: ScrollHandle::new(),
+            body_bounds: Rc::new(Cell::new(Bounds::default())),
+            demo_html: std::env::var("SPOTLIGHT_JIRA_DEMO_HTML")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok()),
             generation: 0,
             focus_handle: cx.focus_handle(),
             nav: ListNav::new(),
@@ -110,6 +162,7 @@ impl JiraView {
     fn select_filter(&mut self, i: usize, cx: &mut Context<Self>) {
         self.active = i;
         self.picker = None;
+        self.reading = None;
         self.revealed = None;
         self.hovered = None;
         self.nav.set(0);
@@ -277,8 +330,13 @@ impl JiraView {
         let _ = std::process::Command::new("/usr/bin/open")
             .arg(&url)
             .spawn();
-        // Record the use. The id matches the search-result id (`jira:KEY`) so
-        // panel-opens and search-opens share history (recents + relevance).
+        self.record_use(key, url);
+    }
+
+    /// Record an issue use (drill-in or browser open). The id matches the
+    /// search-result id (`jira:KEY`) so panel-opens and search-opens share
+    /// history (recents + relevance).
+    fn record_use(&self, key: &str, url: String) {
         let mut cfg = AppConfig::load();
         cfg.record_use(Recent {
             id: format!("jira:{}", key),
@@ -293,10 +351,175 @@ impl JiraView {
         let _ = cfg.save();
     }
 
+    // ---- reading pane -----------------------------------------------------
+
+    /// Drill into an issue: fetch its rendered description + comments and
+    /// draw them via the shared Blitz renderer. The header shows list-row data
+    /// immediately while the fetch runs.
+    fn open_reading(&mut self, issue: &Issue, window: &Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            // Unconfigured (shouldn't happen with rows visible, but stay safe).
+            return;
+        };
+        let key = issue.key.clone();
+        self.record_use(&key, client.browse_url(&key));
+        self.read_scroll.set_offset(Point::default());
+        self.reading = Some(Reading {
+            key: key.clone(),
+            summary: issue.summary.clone(),
+            status: issue.status.clone(),
+            state: ReadState::Loading,
+        });
+
+        let scale = window.scale_factor() as f64;
+        let width = read_width() as u32;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let detail = client.issue_detail(&key)?;
+                    let doc = models::issue_document(&detail);
+                    // Load images by default: this is the user's own Jira
+                    // site, not tracker-laden third-party mail. Auth rides
+                    // along (same-origin only) so attachments resolve.
+                    let rendered = spotlight_htmlview::render_html(
+                        &doc,
+                        RenderOptions {
+                            logical_width: width,
+                            scale,
+                            load_images: true,
+                            base_url: format!("{}/", client.base_url()),
+                            auth: Some(client.auth_header().to_string()),
+                        },
+                    )?;
+                    anyhow::Ok((detail, rendered))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((detail, (r, hit))) => {
+                        // Upgrade header fields with fetched data (the list
+                        // row's status can be stale).
+                        if let Some(reading) = this.reading.as_mut() {
+                            if reading.key == detail.key {
+                                if !detail.summary.is_empty() {
+                                    reading.summary = detail.summary;
+                                }
+                                if !detail.status.is_empty() {
+                                    reading.status = detail.status;
+                                }
+                            }
+                        }
+                        let state = match image::RgbaImage::from_raw(r.width, r.height, r.bgra)
+                        {
+                            Some(buffer) => ReadState::Html {
+                                image: Arc::new(RenderImage::new(vec![image::Frame::new(
+                                    buffer,
+                                )])),
+                                hit,
+                                logical_w: r.logical_width,
+                                logical_h: r.logical_height,
+                            },
+                            None => ReadState::Failed(
+                                "Couldn't display this issue.".to_string(),
+                            ),
+                        };
+                        this.set_read_state(&detail.key, state);
+                    }
+                    Err(e) => {
+                        this.set_read_state_any(ReadState::Failed(format!(
+                            "Couldn't load issue: {e}"
+                        )));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_read_state(&mut self, key: &str, state: ReadState) {
+        if let Some(reading) = self.reading.as_mut() {
+            if reading.key == key {
+                reading.state = state;
+            }
+        }
+    }
+
+    fn set_read_state_any(&mut self, state: ReadState) {
+        if let Some(reading) = self.reading.as_mut() {
+            reading.state = state;
+        }
+    }
+
+    fn close_reading(&mut self) {
+        self.reading = None;
+    }
+
+    /// A click inside the rendered-HTML card: map window coordinates to
+    /// document coordinates and open the link under the pointer, if any.
+    /// Rendered Jira HTML is full of site-relative hrefs (`/browse/KEY`,
+    /// attachment paths), resolved against the site base.
+    fn click_body(&mut self, position: Point<Pixels>, _cx: &mut Context<Self>) {
+        let Some(Reading {
+            state: ReadState::Html { hit, .. },
+            ..
+        }) = &self.reading
+        else {
+            return;
+        };
+        let bounds = self.body_bounds.get();
+        let local_x = f32::from(position.x - bounds.origin.x);
+        let local_y = f32::from(position.y - bounds.origin.y);
+        let Some(href) = hit.hit(local_x, local_y) else {
+            return;
+        };
+        let href = href.trim();
+        let url = if href.starts_with("https://") || href.starts_with("http://") || href.starts_with("mailto:") {
+            Some(href.to_string())
+        } else if href.starts_with('/') {
+            self.client
+                .as_ref()
+                .map(|c| format!("{}{}", c.base_url(), href))
+        } else {
+            None
+        };
+        if let Some(url) = url {
+            let _ = std::process::Command::new("/usr/bin/open").arg(&url).spawn();
+        }
+    }
+
+    fn scroll_reading(&mut self, delta: f32) {
+        let mut offset = self.read_scroll.offset();
+        offset.y = px((f32::from(offset.y) + delta).min(0.0));
+        self.read_scroll.set_offset(offset);
+    }
+
     // ---- keyboard ---------------------------------------------------------
 
-    fn on_key_down(&mut self, event: &gpui::KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+
+        // Reading pane takes precedence while open.
+        if let Some(reading) = &self.reading {
+            match key {
+                "escape" | "left" => self.close_reading(),
+                "up" => self.scroll_reading(SCROLL_STEP),
+                "down" => self.scroll_reading(-SCROLL_STEP),
+                "pageup" => self.scroll_reading(SCROLL_STEP * 5.0),
+                "pagedown" => self.scroll_reading(-SCROLL_STEP * 5.0),
+                // Enter again (or o) continues to the browser.
+                "enter" | "o" => {
+                    let key = reading.key.clone();
+                    self.open_issue(&key);
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
 
         // Status picker navigation takes precedence when it's open.
         if self.picker.is_some() {
@@ -344,7 +567,7 @@ impl JiraView {
                 };
             }
             "enter" => {
-                self.activate_selected(cx);
+                self.activate_selected(window, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -355,12 +578,12 @@ impl JiraView {
         cx.notify();
     }
 
-    fn activate_selected(&mut self, cx: &mut Context<Self>) {
+    fn activate_selected(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(issue) = self.issues.get(self.nav.selected).cloned() else {
             return;
         };
         match self.action_focus {
-            None => self.open_issue(&issue.key),
+            None => self.open_reading(&issue, window, cx),
             Some(0) => self.assign_to_me(issue.key, cx),
             Some(1) => self.open_status_picker(issue.key, cx),
             _ => {}
@@ -466,8 +689,10 @@ impl JiraView {
                     ),
             )
             .on_mouse_down(MouseButton::Left, {
-                let key = key.clone();
-                cx.listener(move |this, _, _, _| this.open_issue(&key))
+                let issue = issue.clone();
+                cx.listener(move |this, _, window: &mut Window, cx| {
+                    this.open_reading(&issue, window, cx)
+                })
             });
 
         let mut col = div()
@@ -659,6 +884,208 @@ impl JiraView {
             .child(content)
             .into_any_element()
     }
+
+    /// Full-panel reading pane: back arrow + key/status byline + summary on
+    /// the left, "Open in Jira ↗" on the right, the rendered issue below.
+    fn render_reading(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(reading) = &self.reading else {
+            return centered("");
+        };
+        let key = reading.key.clone();
+        let byline = if reading.status.is_empty() {
+            key.clone()
+        } else {
+            format!("{} · {}", key, reading.status)
+        };
+        let summary = if reading.summary.is_empty() {
+            key.clone()
+        } else {
+            reading.summary.clone()
+        };
+
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .id("jira-read-back")
+                    .size(px(28.))
+                    .rounded_lg()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme::accent())
+                    .text_xl()
+                    .child("‹")
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.close_reading();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(div().text_xs().text_color(theme::muted()).child(byline))
+                    .child(div().truncate().text_xl().text_color(theme::text()).child(summary)),
+            )
+            .child(
+                div()
+                    .id("jira-read-open")
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(theme::tile())
+                    .hover(|s| s.bg(theme::hover_strong()))
+                    .text_xs()
+                    .text_color(theme::accent())
+                    .child("Open in Jira ↗")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, _| this.open_issue(&key)),
+                    ),
+            );
+
+        let content: AnyElement = match &reading.state {
+            ReadState::Loading => centered("Loading issue…"),
+            ReadState::Failed(msg) => centered(msg),
+            ReadState::Html {
+                image,
+                logical_w,
+                logical_h,
+                ..
+            } => {
+                let bounds_cell = self.body_bounds.clone();
+                let card = div()
+                    .id("jira-read-card")
+                    .relative()
+                    .w(px(*logical_w))
+                    .h(px(*logical_h))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    // White under the image: the document renders on white,
+                    // and if the image itself fails to paint this shows a
+                    // white card (image problem) instead of nothing (layout
+                    // problem).
+                    .bg(gpui::rgb(0xffffff))
+                    .child(
+                        img(ImageSource::Render(image.clone()))
+                            .w(px(*logical_w))
+                            .h(px(*logical_h)),
+                    )
+                    // Capture the card's painted bounds each frame so clicks
+                    // can be mapped from window space into document space.
+                    .child(
+                        canvas(
+                            move |bounds, _, _| bounds_cell.set(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                            this.click_body(ev.position, cx)
+                        }),
+                    );
+                self.scrollable_body(div().flex().justify_center().py_4().child(card))
+            }
+        };
+
+        div()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(div().h(px(1.)).bg(theme::divider()))
+            .child(content)
+            .into_any_element()
+    }
+
+    fn scrollable_body(&self, inner: impl IntoElement) -> AnyElement {
+        div()
+            .id("jira-read-scroll")
+            .flex_1()
+            // min-height:0 lets this flex child shrink below its content so the
+            // overflow actually scrolls (see the jira-list note).
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.read_scroll)
+            .child(inner)
+            .into_any_element()
+    }
+
+    /// Capture aid: render a file's HTML as a synthetic issue's description
+    /// without a configured client or network.
+    fn open_demo_reading(&mut self, html: String, window: &Window, cx: &mut Context<Self>) {
+        self.read_scroll.set_offset(Point::default());
+        self.reading = Some(Reading {
+            key: "DEMO-1".to_string(),
+            summary: "Demo issue".to_string(),
+            status: "In Progress".to_string(),
+            state: ReadState::Loading,
+        });
+        let detail = models::IssueDetail {
+            key: "DEMO-1".to_string(),
+            summary: "Demo issue".to_string(),
+            status: "In Progress".to_string(),
+            description_html: Some(html),
+            comments: Vec::new(),
+        };
+        let doc = models::issue_document(&detail);
+        let scale = window.scale_factor() as f64;
+        let width = read_width() as u32;
+        cx.spawn(async move |this, cx| {
+            let rendered = cx
+                .background_executor()
+                .spawn(async move {
+                    spotlight_htmlview::render_html(
+                        &doc,
+                        RenderOptions {
+                            logical_width: width,
+                            scale,
+                            load_images: false,
+                            base_url: "https://example.atlassian.net/".to_string(),
+                            auth: None,
+                        },
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let state = match rendered {
+                    Ok((r, hit)) => match image::RgbaImage::from_raw(r.width, r.height, r.bgra) {
+                        Some(buffer) => ReadState::Html {
+                            image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                            hit,
+                            logical_w: r.logical_width,
+                            logical_h: r.logical_height,
+                        },
+                        None => ReadState::Failed("Couldn't display this issue.".to_string()),
+                    },
+                    Err(e) => ReadState::Failed(format!("Couldn't render: {e}")),
+                };
+                this.set_read_state("DEMO-1", state);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
 }
 
 impl Render for JiraView {
@@ -668,6 +1095,16 @@ impl Render for JiraView {
         if !self.focused_once {
             window.focus(&self.focus_handle, cx);
             self.focused_once = true;
+        }
+
+        // Debug aid: drop straight into the reading pane with a file's HTML.
+        if let Some(html) = self.demo_html.take() {
+            self.open_demo_reading(html, window, cx);
+        }
+
+        // The reading pane takes over the whole panel as its own view.
+        if self.reading.is_some() {
+            return self.render_reading(cx);
         }
 
         // The status picker takes over the whole panel as its own view.

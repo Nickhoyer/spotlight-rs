@@ -1,0 +1,19 @@
+[package]
+name = "spotlight-htmlview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+anyrender.workspace = true
+anyrender_vello_cpu.workspace = true
+blitz-dom.workspace = true
+blitz-html.workspace = true
+blitz-paint.workspace = true
+blitz-traits.workspace = true
+ureq.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+image.workspace = true
