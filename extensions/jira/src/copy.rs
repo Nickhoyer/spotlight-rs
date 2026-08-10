@@ -13,8 +13,25 @@
 //! authors — so it's stable between opens rather than depending on which
 //! mention happened to be converted first.
 
-use crate::markdown::html_to_markdown;
+use crate::markdown::{convert, Hooks};
 use crate::models::IssueDetail;
+
+/// An inline image, in the order it appears in the ticket — the same order the
+/// `[ATTACHMENT n]` placeholders are numbered, so pasting them in sequence
+/// matches the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// Absolute URL on the Jira site; fetching it needs the API credential.
+    pub url: String,
+    /// Original filename, kept so the model can tie image to placeholder.
+    pub name: String,
+}
+
+/// A ticket rendered for pasting: the Markdown, plus the images it refers to.
+pub struct Copied {
+    pub markdown: String,
+    pub attachments: Vec<Attachment>,
+}
 
 /// Assigns and remembers a pseudonym per person.
 #[derive(Default)]
@@ -69,8 +86,13 @@ impl People {
 /// Deliberately carries no link back to the Jira site: pseudonymizing people
 /// while leaving the instance URL in place would give the names straight back
 /// to anyone who can reach it.
-pub fn issue_markdown(detail: &IssueDetail) -> String {
+pub fn issue_markdown(detail: &IssueDetail) -> Copied {
     let mut people = People::default();
+    // Inline images become numbered placeholders: the URLs point at the Jira
+    // site (so they leak the instance the way the link line did, and need the
+    // API credential to fetch anyway), and a placeholder gives the model
+    // something to line the pasted image up with.
+    let mut attachments: Vec<Attachment> = Vec::new();
     // Seed in reading order so the numbering is meaningful and stable.
     let reporter = detail.reporter.as_ref().map(|n| people.pseudonym(n));
     let assignee = detail.assignee.as_ref().map(|n| people.pseudonym(n));
@@ -102,13 +124,25 @@ pub fn issue_markdown(detail: &IssueDetail) -> String {
     out.push_str(&meta.join("\n"));
     out.push_str("\n\n## Description\n\n");
     match &detail.description_html {
-        Some(html) => out.push_str(&html_to_markdown(html, &mut |n| people.pseudonym(n))),
+        Some(html) => out.push_str(&convert(
+            html,
+            &mut Hooks {
+                on_mention: &mut |n| people.pseudonym(n),
+                on_image: &mut |alt, src| placeholder(&mut attachments, alt, src),
+            },
+        )),
         None => out.push_str("_No description._"),
     }
 
     for field in &detail.custom_fields {
         out.push_str(&format!("\n\n## {}\n\n", field.name.trim()));
-        out.push_str(&html_to_markdown(&field.html, &mut |n| people.pseudonym(n)));
+        out.push_str(&convert(
+            &field.html,
+            &mut Hooks {
+                on_mention: &mut |n| people.pseudonym(n),
+                on_image: &mut |alt, src| placeholder(&mut attachments, alt, src),
+            },
+        ));
     }
 
     if !detail.comments.is_empty() {
@@ -121,9 +155,13 @@ pub fn issue_markdown(detail: &IssueDetail) -> String {
                 out.push_str(&format!(" ({when})"));
             }
             out.push_str("\n\n");
-            out.push_str(&html_to_markdown(&comment.body_html, &mut |n| {
-                people.pseudonym(n)
-            }));
+            out.push_str(&convert(
+                &comment.body_html,
+                &mut Hooks {
+                    on_mention: &mut |n| people.pseudonym(n),
+                    on_image: &mut |alt, src| placeholder(&mut attachments, alt, src),
+                },
+            ));
             out.push('\n');
         }
     }
@@ -137,7 +175,37 @@ pub fn issue_markdown(detail: &IssueDetail) -> String {
 
     // Sweep prose mentions the structured pass couldn't see.
     let out = people.scrub(&out);
-    format!("{}\n", out.trim_end())
+    Copied {
+        markdown: format!("{}\n", out.trim_end()),
+        attachments,
+    }
+}
+
+/// Record an inline image and return the placeholder that stands in for it.
+fn placeholder(attachments: &mut Vec<Attachment>, alt: &str, src: &str) -> String {
+    let src = src.trim();
+    if src.is_empty() {
+        return String::new();
+    }
+    let name = alt
+        .trim()
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("image")
+        .to_string();
+    // The same image twice keeps one number rather than being pasted twice.
+    let index = match attachments.iter().position(|a| a.url == src) {
+        Some(i) => i,
+        None => {
+            attachments.push(Attachment {
+                url: src.to_string(),
+                name: name.clone(),
+            });
+            attachments.len() - 1
+        }
+    };
+    format!("[ATTACHMENT {}: {}]", index + 1, attachments[index].name)
 }
 
 #[cfg(test)]
@@ -179,7 +247,7 @@ mod tests {
 
     #[test]
     fn renders_the_whole_ticket_as_markdown() {
-        let md = issue_markdown(&ticket());
+        let md = issue_markdown(&ticket()).markdown;
         assert!(md.starts_with("# SO-2522 — Allow custom Mapped ID\n"));
         assert!(md.contains("- **Type:** Story"));
         assert!(md.contains("- **Status:** To Do"));
@@ -197,7 +265,7 @@ mod tests {
 
     #[test]
     fn people_are_pseudonymized_consistently() {
-        let md = issue_markdown(&ticket());
+        let md = issue_markdown(&ticket()).markdown;
         // Reading order: reporter, assignee, then comment authors.
         assert!(md.contains("- **Reporter:** User1"), "{md}");
         assert!(md.contains("- **Assignee:** User2"), "{md}");
@@ -210,6 +278,31 @@ mod tests {
             assert!(!md.contains(name), "leaked {name}:\n{md}");
         }
         assert!(md.contains("replaced with User1, User2"));
+    }
+
+    #[test]
+    fn images_become_numbered_placeholders() {
+        let mut t = ticket();
+        t.description_html = Some(
+            r#"<p>before</p><p><span class="image-wrap"><img src="https://x.atlassian.net/rest/api/3/attachment/content/328725" alt="image-20260629-142022.png" width="671" /></span></p>"#
+                .into(),
+        );
+        t.comments[0].body_html =
+            r#"<p>also <img src="https://x.atlassian.net/attach/2" alt="second.png"> and the same one again <img src="https://x.atlassian.net/rest/api/3/attachment/content/328725" alt="image-20260629-142022.png"></p>"#
+                .into();
+        let copied = issue_markdown(&t);
+
+        assert!(copied.markdown.contains("[ATTACHMENT 1: image-20260629-142022.png]"));
+        assert!(copied.markdown.contains("[ATTACHMENT 2: second.png]"));
+        // No image URL survives — they point at the instance, same as the link.
+        assert!(!copied.markdown.contains("atlassian.net"), "{}", copied.markdown);
+        assert!(!copied.markdown.contains("!["), "{}", copied.markdown);
+        // Numbered in reading order, and a repeat reuses its number.
+        assert_eq!(
+            copied.attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["image-20260629-142022.png", "second.png"]
+        );
+        assert_eq!(copied.markdown.matches("ATTACHMENT 1").count(), 2);
     }
 
     #[test]
@@ -242,7 +335,7 @@ mod tests {
             description_html: Some("<p>body</p>".into()),
             ..Default::default()
         };
-        let md = issue_markdown(&bare);
+        let md = issue_markdown(&bare).markdown;
         assert!(!md.contains("User1"), "{md}");
         assert!(!md.contains("replaced with"), "{md}");
         assert!(md.contains("## Description\n\nbody"));

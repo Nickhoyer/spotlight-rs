@@ -82,8 +82,13 @@ struct Reading {
     /// The fetched issue, kept so "Copy for Claude" can render Markdown
     /// without refetching.
     detail: Option<models::IssueDetail>,
-    /// Set briefly after a copy so the button can confirm it.
+    /// Set briefly after a copy so the button can confirm it, along with how
+    /// many images are waiting on the user's paste (0 = nothing follows).
     copied: bool,
+    pending_images: usize,
+    /// Live ⌘V watch from the last copy, if the ticket had attachments.
+    /// Dropping it (closing the pane, copying again) ends the window.
+    paste_watch: Option<spotlight_platform_macos::paste_watch::PasteWatch>,
 }
 
 /// State for the full-panel "Update status" transition picker.
@@ -405,6 +410,8 @@ impl JiraView {
             state: ReadState::Loading,
             detail: None,
             copied: false,
+            pending_images: 0,
+            paste_watch: None,
         });
 
         let scale = window.scale_factor() as f64;
@@ -536,6 +543,10 @@ impl JiraView {
 
     /// Put the open issue on the clipboard as Markdown, people pseudonymized,
     /// ready to paste into a chat. No-op until the fetch has landed.
+    ///
+    /// Inline images can't ride along on a text clipboard, so if the ticket
+    /// has any we arm [`paste_watch`](spotlight_platform_macos::paste_watch)
+    /// and hand them over when the user pastes — see [`Self::deliver_attachments`].
     fn copy_for_claude(&mut self, cx: &mut Context<Self>) {
         let Some(reading) = self.reading.as_mut() else {
             return;
@@ -543,26 +554,79 @@ impl JiraView {
         let Some(detail) = reading.detail.clone() else {
             return;
         };
-        spotlight_platform_macos::clipboard::write_text(&copy::issue_markdown(&detail));
+        let copied = copy::issue_markdown(&detail);
+        spotlight_platform_macos::clipboard::write_text(&copied.markdown);
         reading.copied = true;
+        // Attachments only arrive if we can actually see the user's paste.
+        reading.pending_images = if spotlight_platform_macos::paste_watch::can_watch() {
+            copied.attachments.len()
+        } else {
+            0
+        };
+        // Any previous window is over the moment a new copy happens.
+        reading.paste_watch = None;
+        if !copied.attachments.is_empty() {
+            self.arm_attachment_delivery(copied, cx);
+        }
         cx.notify();
 
         // Let the confirmation fade back to the resting label.
         let key = detail.key.clone();
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1600))
-                .await;
+            cx.background_executor().timer(CONFIRM_FOR).await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(reading) = this.reading.as_mut() {
                     if reading.key == key {
                         reading.copied = false;
+                        reading.pending_images = 0;
                         cx.notify();
                     }
                 }
             });
         })
         .detach();
+    }
+
+    /// Fetch the ticket's images, then wait for the user's ⌘V and paste them in
+    /// behind the text.
+    ///
+    /// The ⌘V is the point: it's the only signal macOS gives that a text field
+    /// is focused and the target app is ready. We don't intercept it — the
+    /// user's own paste delivers the text as normal, and only then do we take
+    /// over the clipboard.
+    fn arm_attachment_delivery(&mut self, copied: copy::Copied, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let markdown = copied.markdown.clone();
+        let attachments = copied.attachments.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Download while the user is still switching apps. The watch is armed
+        // *now* rather than when this finishes, so a quick paste can't slip
+        // through the gap; the callback waits on this channel instead.
+        cx.background_executor()
+            .spawn(async move {
+                let images: Vec<Vec<u8>> = attachments
+                    .iter()
+                    .filter_map(|a| client.fetch_attachment_png(&a.url).ok())
+                    .collect();
+                let _ = tx.send(images);
+            })
+            .detach();
+
+        let watch = spotlight_platform_macos::paste_watch::watch_for_paste(PASTE_WINDOW, move || {
+            // Runs on the watch thread, so blocking here is fine.
+            let Ok(images) = rx.recv_timeout(FETCH_WAIT) else {
+                return;
+            };
+            if !images.is_empty() {
+                deliver_attachments(images, markdown);
+            }
+        });
+        if let Some(reading) = self.reading.as_mut() {
+            reading.paste_watch = Some(watch);
+        }
     }
 
     fn scroll_reading(&mut self, delta: f32) {
@@ -972,6 +1036,7 @@ impl JiraView {
         // has landed.
         let can_copy = reading.detail.is_some();
         let copied = reading.copied;
+        let pending_images = reading.pending_images;
         let byline = if reading.status.is_empty() {
             key.clone()
         } else {
@@ -1034,10 +1099,13 @@ impl JiraView {
                         .hover(|s| s.bg(theme::hover_strong()))
                         .text_xs()
                         .text_color(theme::accent())
-                        .child(if copied {
-                            "Copied ✓"
-                        } else {
-                            "Copy for Claude"
+                        .child(match (copied, pending_images) {
+                            (false, _) => "Copy for Claude".to_string(),
+                            (true, 0) => "Copied ✓".to_string(),
+                            // Tell the user their paste does something extra,
+                            // or the images arriving would just be magic.
+                            (true, 1) => "Copied ✓ · paste to add the image".to_string(),
+                            (true, n) => format!("Copied ✓ · paste to add {n} images"),
                         })
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1148,6 +1216,8 @@ impl JiraView {
             state: ReadState::Loading,
             detail: None,
             copied: false,
+            pending_images: 0,
+            paste_watch: None,
         });
         let detail = models::IssueDetail {
             key: "DEMO-1".to_string(),
@@ -1292,6 +1362,55 @@ impl Render for JiraView {
             .child(body)
             .into_any_element()
     }
+}
+
+/// How long the button keeps confirming the copy. Matches the paste window so
+/// the hint is on screen for exactly as long as it is true.
+const CONFIRM_FOR: Duration = Duration::from_secs(10);
+
+/// How long after a copy we watch for the user's paste before giving up.
+const PASTE_WINDOW: Duration = Duration::from_secs(10);
+
+/// How long the paste callback will wait for a still-running download.
+const FETCH_WAIT: Duration = Duration::from_secs(8);
+
+/// Bundle id of the Claude desktop app — attachments are only injected when
+/// it's the app in front, so a paste into anything else is left alone.
+const CLAUDE_BUNDLE_ID: &str = "com.anthropic.claudefordesktop";
+
+/// Grace period after the user's ⌘V before we touch the clipboard.
+///
+/// Their paste is already on its way to the app, which reads the pasteboard
+/// while handling the keystroke — a few milliseconds later. Overwriting the
+/// clipboard too early would turn their text paste into an image paste and
+/// lose the ticket, and macOS offers no "paste completed" signal to wait on,
+/// so this is a deliberate margin over an operation that takes microseconds.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// Gap between the images we paste. Each one is decoded and attached by the
+/// receiving app, which is slower than a text paste.
+const BETWEEN_IMAGES: Duration = Duration::from_millis(250);
+
+/// Hand the ticket's images to the app the user just pasted into, one ⌘V each,
+/// then put the text back on the clipboard.
+///
+/// Runs on the paste-watch thread once the tap is gone, so our own synthetic
+/// keystrokes can't be mistaken for the user's.
+fn deliver_attachments(images: Vec<Vec<u8>>, markdown: String) {
+    // Only ever type into Claude. If the user pasted somewhere else, their
+    // text landed there and we quietly stay out of it.
+    if spotlight_platform_macos::apps::frontmost_bundle_id().as_deref() != Some(CLAUDE_BUNDLE_ID) {
+        return;
+    }
+    std::thread::sleep(SETTLE);
+    for png in &images {
+        spotlight_platform_macos::clipboard::write_image_png(png);
+        spotlight_platform_macos::input::paste();
+        std::thread::sleep(BETWEEN_IMAGES);
+    }
+    // Leave the ticket text on the clipboard rather than the last image, so a
+    // second ⌘V repeats the paste the user actually asked for.
+    spotlight_platform_macos::clipboard::write_text(&markdown);
 }
 
 /// A centered muted message filling the available space (empty/loading/error).

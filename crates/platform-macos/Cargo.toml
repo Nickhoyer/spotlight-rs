@@ -13,6 +13,9 @@ objc = "0.2"
 # rasterizing app icons via NSWorkspace (NSImage -> NSBitmapImageRep -> RGBA).
 # Also CGEvent for synthesizing the paste (⌘V) keystroke.
 core-graphics = "0.24"
+# core-graphics 0.24 speaks core-foundation 0.10; the rest of this crate is on
+# 0.9, so the newer one is pulled in under an alias for the event-tap code.
+cf-modern = { package = "core-foundation", version = "0.10" }
 # Building the options dict for the Accessibility-permission prompt.
 core-foundation = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }

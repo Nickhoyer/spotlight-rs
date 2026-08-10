@@ -6095,6 +6095,7 @@ name = "spotlight-platform-macos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.0",
  "core-foundation 0.9.4",
  "core-graphics 0.24.0",
  "image",

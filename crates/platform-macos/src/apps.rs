@@ -88,3 +88,32 @@ pub fn launch(path: &Path) -> anyhow::Result<()> {
     std::process::Command::new("/usr/bin/open").arg(path).spawn()?;
     Ok(())
 }
+
+/// Bundle identifier of the app currently in front, if any.
+///
+/// Used before synthesizing keystrokes so input only ever lands in the app the
+/// user actually switched to.
+pub fn frontmost_bundle_id() -> Option<String> {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return None;
+        }
+        let app: *mut Object = msg_send![workspace, frontmostApplication];
+        if app.is_null() {
+            return None;
+        }
+        let id: *mut Object = msg_send![app, bundleIdentifier];
+        if id.is_null() {
+            return None;
+        }
+        let utf8: *const std::os::raw::c_char = msg_send![id, UTF8String];
+        if utf8.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(utf8).to_str().ok().map(str::to_owned)
+    }
+}

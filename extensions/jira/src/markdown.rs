@@ -43,14 +43,20 @@ impl Node {
     }
 }
 
-/// Convert rendered Jira HTML to Markdown.
-///
-/// `on_mention` is called with the display name of each user mention and
-/// returns what to write instead — identity to keep names, or a pseudonym.
-pub fn html_to_markdown(html: &str, on_mention: &mut dyn FnMut(&str) -> String) -> String {
+/// Callbacks for the content that needs the caller's judgement.
+pub struct Hooks<'a> {
+    /// Given a mention's display name, what to write instead.
+    pub on_mention: &'a mut dyn FnMut(&str) -> String,
+    /// Given an image's alt text and source, what to write instead. The
+    /// default emits an ordinary Markdown image.
+    pub on_image: &'a mut dyn FnMut(&str, &str) -> String,
+}
+
+/// Convert with full control over mentions and images.
+pub fn convert(html: &str, hooks: &mut Hooks) -> String {
     let nodes = parse(html);
     let mut out = String::new();
-    render_blocks(&nodes, &mut out, 0, on_mention);
+    render_blocks(&nodes, &mut out, 0, hooks);
     tidy(&out)
 }
 
@@ -285,7 +291,7 @@ fn render_blocks(
     nodes: &[Node],
     out: &mut String,
     depth: usize,
-    on_mention: &mut dyn FnMut(&str) -> String,
+    hooks: &mut Hooks,
 ) {
     for node in nodes {
         match node {
@@ -297,11 +303,11 @@ fn render_blocks(
             }
             Node::Element { name, children, .. } => match name.as_str() {
                 "p" | "div" | "section" | "article" | "header" | "footer" => {
-                    let inline = render_inline(children, on_mention);
+                    let inline = render_inline(children, hooks);
                     // A wrapper whose content is itself blocks (Jira nests
                     // divs around panels and code) renders as blocks instead.
                     if has_block_child(children) {
-                        render_blocks(children, out, depth, on_mention);
+                        render_blocks(children, out, depth, hooks);
                     } else if !inline.trim().is_empty() {
                         block_gap(out);
                         out.push_str(inline.trim());
@@ -312,9 +318,9 @@ fn render_blocks(
                     block_gap(out);
                     out.push_str(&"#".repeat(level.clamp(1, 6)));
                     out.push(' ');
-                    out.push_str(render_inline(children, on_mention).trim());
+                    out.push_str(render_inline(children, hooks).trim());
                 }
-                "ul" | "ol" => render_list(node, out, "", on_mention),
+                "ul" | "ol" => render_list(node, out, "", hooks),
                 "pre" => {
                     block_gap(out);
                     out.push_str("```\n");
@@ -323,7 +329,7 @@ fn render_blocks(
                 }
                 "blockquote" => {
                     let mut inner = String::new();
-                    render_blocks(children, &mut inner, depth, on_mention);
+                    render_blocks(children, &mut inner, depth, hooks);
                     block_gap(out);
                     for (i, line) in tidy(&inner).lines().enumerate() {
                         if i > 0 {
@@ -337,14 +343,14 @@ fn render_blocks(
                     block_gap(out);
                     out.push_str("---");
                 }
-                "table" => render_table(node, out, on_mention),
+                "table" => render_table(node, out, hooks),
                 "br" => out.push('\n'),
                 // Anything else: blocks recurse, inline content is emitted.
                 _ => {
                     if has_block_child(children) {
-                        render_blocks(children, out, depth, on_mention);
+                        render_blocks(children, out, depth, hooks);
                     } else {
-                        let inline = render_inline(std::slice::from_ref(node), on_mention);
+                        let inline = render_inline(std::slice::from_ref(node), hooks);
                         if !inline.trim().is_empty() {
                             block_gap(out);
                             out.push_str(inline.trim());
@@ -385,7 +391,7 @@ fn render_list(
     list: &Node,
     out: &mut String,
     indent: &str,
-    on_mention: &mut dyn FnMut(&str) -> String,
+    hooks: &mut Hooks,
 ) {
     let Node::Element { name, children, .. } = list else {
         return;
@@ -411,7 +417,7 @@ fn render_list(
             .filter(|c| !matches!(c, Node::Element { name, .. } if name == "ul" || name == "ol"))
             .cloned()
             .collect();
-        let text = render_inline(&inline, on_mention);
+        let text = render_inline(&inline, hooks);
         let text = text.trim();
 
         // One line per item — items are not blocks, so no blank line between.
@@ -433,15 +439,15 @@ fn render_list(
         for nested in children {
             if matches!(nested, Node::Element { name, .. } if name == "ul" || name == "ol") {
                 out.push('\n');
-                render_list(nested, out, &child_indent, on_mention);
+                render_list(nested, out, &child_indent, hooks);
             }
         }
     }
 }
 
-fn render_table(table: &Node, out: &mut String, on_mention: &mut dyn FnMut(&str) -> String) {
+fn render_table(table: &Node, out: &mut String, hooks: &mut Hooks) {
     let mut rows: Vec<(bool, Vec<String>)> = Vec::new();
-    collect_rows(table, &mut rows, on_mention);
+    collect_rows(table, &mut rows, hooks);
     if rows.is_empty() {
         return;
     }
@@ -474,7 +480,7 @@ fn render_table(table: &Node, out: &mut String, on_mention: &mut dyn FnMut(&str)
 fn collect_rows(
     node: &Node,
     rows: &mut Vec<(bool, Vec<String>)>,
-    on_mention: &mut dyn FnMut(&str) -> String,
+    hooks: &mut Hooks,
 ) {
     let Node::Element { name, children, .. } = node else {
         return;
@@ -486,7 +492,7 @@ fn collect_rows(
             if let Node::Element { name, children, .. } = cell {
                 if name == "th" || name == "td" {
                     header |= name == "th";
-                    cells.push(render_inline(children, on_mention).trim().replace('\n', " "));
+                    cells.push(render_inline(children, hooks).trim().replace('\n', " "));
                 }
             }
         }
@@ -496,12 +502,12 @@ fn collect_rows(
         return;
     }
     for child in children {
-        collect_rows(child, rows, on_mention);
+        collect_rows(child, rows, hooks);
     }
 }
 
 /// Render inline content (no block structure) to Markdown.
-fn render_inline(nodes: &[Node], on_mention: &mut dyn FnMut(&str) -> String) -> String {
+fn render_inline(nodes: &[Node], hooks: &mut Hooks) -> String {
     let mut out = String::new();
     for node in nodes {
         match node {
@@ -509,10 +515,10 @@ fn render_inline(nodes: &[Node], on_mention: &mut dyn FnMut(&str) -> String) -> 
             Node::Element {
                 name, children, ..
             } => match name.as_str() {
-                "b" | "strong" => wrap(&mut out, "**", &render_inline(children, on_mention)),
-                "i" | "em" => wrap(&mut out, "*", &render_inline(children, on_mention)),
+                "b" | "strong" => wrap(&mut out, "**", &render_inline(children, hooks)),
+                "i" | "em" => wrap(&mut out, "*", &render_inline(children, hooks)),
                 "del" | "s" | "strike" => {
-                    wrap(&mut out, "~~", &render_inline(children, on_mention))
+                    wrap(&mut out, "~~", &render_inline(children, hooks))
                 }
                 "code" | "tt" | "kbd" | "samp" => {
                     let text = collapse_ws(&node.text());
@@ -524,14 +530,14 @@ fn render_inline(nodes: &[Node], on_mention: &mut dyn FnMut(&str) -> String) -> 
                     }
                 }
                 "a" => {
-                    let text = render_inline(children, on_mention);
+                    let text = render_inline(children, hooks);
                     let text = text.trim();
                     let href = node.attr("href").unwrap_or("").trim();
                     if is_mention(node) {
                         // A person, not a destination: the pseudonym replaces
                         // the whole link so no profile URL leaks the name.
                         out.push('@');
-                        out.push_str(&on_mention(text));
+                        out.push_str(&(hooks.on_mention)(text));
                     } else if text.is_empty() {
                         out.push_str(href);
                     } else if href.is_empty() || href == text {
@@ -543,10 +549,10 @@ fn render_inline(nodes: &[Node], on_mention: &mut dyn FnMut(&str) -> String) -> 
                 "img" => {
                     let alt = node.attr("alt").unwrap_or("image");
                     let src = node.attr("src").unwrap_or("");
-                    out.push_str(&format!("![{alt}]({src})"));
+                    out.push_str(&(hooks.on_image)(alt, src));
                 }
                 "br" => out.push('\n'),
-                _ => out.push_str(&render_inline(children, on_mention)),
+                _ => out.push_str(&render_inline(children, hooks)),
             },
         }
     }
@@ -630,9 +636,26 @@ fn tidy(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Convert with mentions left as-is.
+    /// Convert with mentions and images left as they are.
     fn md(html: &str) -> String {
-        html_to_markdown(html, &mut |name| name.to_string())
+        convert(
+            html,
+            &mut Hooks {
+                on_mention: &mut |name| name.to_string(),
+                on_image: &mut |alt, src| format!("![{alt}]({src})"),
+            },
+        )
+    }
+
+    /// Convert, routing mentions through `on_mention`.
+    fn md_mentions(html: &str, on_mention: &mut dyn FnMut(&str) -> String) -> String {
+        convert(
+            html,
+            &mut Hooks {
+                on_mention,
+                on_image: &mut |alt, src| format!("![{alt}]({src})"),
+            },
+        )
     }
 
     #[test]
@@ -716,7 +739,7 @@ mod tests {
         // The real markup: a profile anchor with the account id.
         let html = r#"<p><a href="https://x.atlassian.net/secure/ViewProfile.jspa?accountId=712020%3Ad72c" class="user-hover" data-account-id="712020:d72c" rel="noreferrer">Ihor Karaianidi</a>  </p>"#;
         let mut seen = Vec::new();
-        let out = html_to_markdown(html, &mut |name| {
+        let out = md_mentions(html, &mut |name| {
             seen.push(name.to_string());
             "User3".to_string()
         });
@@ -728,7 +751,7 @@ mod tests {
     #[test]
     fn ordinary_links_are_not_mistaken_for_mentions() {
         let html = r#"<p><a href="https://x.test/browse/SO-1">SO-1</a></p>"#;
-        let out = html_to_markdown(html, &mut |_| "User1".to_string());
+        let out = md_mentions(html, &mut |_| "User1".to_string());
         assert_eq!(out, "[SO-1](https://x.test/browse/SO-1)");
     }
 

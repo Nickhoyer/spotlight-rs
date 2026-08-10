@@ -3,10 +3,14 @@
 //! All methods block on the network, so callers run them on gpui's background
 //! executor rather than the UI thread (see `view.rs`).
 
+use std::io::Read as _;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use base64::Engine as _;
+
+/// Cap on a single fetched attachment, so a huge upload can't stall a copy.
+const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
 use crate::models::{
     Account, Issue, IssueDetail, IssueDetailResponse, SearchResponse, Transition,
@@ -98,6 +102,34 @@ impl JiraClient {
             .call()?
             .into_json()?;
         Ok(IssueDetail::from_raw(key.to_string(), resp))
+    }
+
+    /// Fetch an inline attachment as PNG bytes, ready for the clipboard.
+    ///
+    /// Only URLs on the configured site are fetched, and only those carry the
+    /// credential — an issue body can embed an image from anywhere. Jira
+    /// redirects attachment content to its media CDN; ureq follows that but
+    /// drops the auth header off-host, which is what we want (the redirect is
+    /// pre-signed). Whatever format comes back is re-encoded, since the
+    /// clipboard is handed PNG.
+    pub fn fetch_attachment_png(&self, url: &str) -> Result<Vec<u8>> {
+        if !url.starts_with(&self.base_url) {
+            bail!("attachment is not on {}", self.base_url);
+        }
+        let resp = self
+            .agent
+            .get(url)
+            .set("Authorization", &self.auth)
+            .call()?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .take(MAX_ATTACHMENT_BYTES)
+            .read_to_end(&mut bytes)?;
+
+        let image = image::load_from_memory(&bytes)?;
+        let mut png = Vec::new();
+        image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        Ok(png)
     }
 
     /// The authenticated user (for "Assign to me").
