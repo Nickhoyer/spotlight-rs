@@ -65,7 +65,11 @@ impl People {
 }
 
 /// The whole ticket as Markdown, ready to paste into a chat.
-pub fn issue_markdown(detail: &IssueDetail, url: &str) -> String {
+///
+/// Deliberately carries no link back to the Jira site: pseudonymizing people
+/// while leaving the instance URL in place would give the names straight back
+/// to anyone who can reach it.
+pub fn issue_markdown(detail: &IssueDetail) -> String {
     let mut people = People::default();
     // Seed in reading order so the numbering is meaningful and stable.
     let reporter = detail.reporter.as_ref().map(|n| people.pseudonym(n));
@@ -95,7 +99,6 @@ pub fn issue_markdown(detail: &IssueDetail, url: &str) -> String {
     add("Reporter", reporter.as_deref().unwrap_or(""));
     add("Parent", detail.parent_key.as_deref().unwrap_or(""));
     add("Labels", &detail.labels.join(", "));
-    add("Link", url);
     out.push_str(&meta.join("\n"));
     out.push_str("\n\n## Description\n\n");
     match &detail.description_html {
@@ -176,13 +179,15 @@ mod tests {
 
     #[test]
     fn renders_the_whole_ticket_as_markdown() {
-        let md = issue_markdown(&ticket(), "https://x.atlassian.net/browse/SO-2522");
+        let md = issue_markdown(&ticket());
         assert!(md.starts_with("# SO-2522 — Allow custom Mapped ID\n"));
         assert!(md.contains("- **Type:** Story"));
         assert!(md.contains("- **Status:** To Do"));
         assert!(md.contains("- **Parent:** SO-2439"));
         assert!(md.contains("- **Labels:** frontend"));
-        assert!(md.contains("- **Link:** https://x.atlassian.net/browse/SO-2522"));
+        // No link back to the instance — it would undo the pseudonyms.
+        assert!(!md.contains("atlassian.net"), "{md}");
+        assert!(!md.to_lowercase().contains("link"), "{md}");
         assert!(md.contains("## Description\n\nMapped ID needs a Custom option."));
         assert!(md.contains("## Definition of Done\n\n- Custom ids allowed"));
         assert!(md.contains("## Comments (2)"));
@@ -192,7 +197,7 @@ mod tests {
 
     #[test]
     fn people_are_pseudonymized_consistently() {
-        let md = issue_markdown(&ticket(), "https://x.test/browse/SO-2522");
+        let md = issue_markdown(&ticket());
         // Reading order: reporter, assignee, then comment authors.
         assert!(md.contains("- **Reporter:** User1"), "{md}");
         assert!(md.contains("- **Assignee:** User2"), "{md}");
@@ -237,7 +242,7 @@ mod tests {
             description_html: Some("<p>body</p>".into()),
             ..Default::default()
         };
-        let md = issue_markdown(&bare, "https://x.test/browse/X-1");
+        let md = issue_markdown(&bare);
         assert!(!md.contains("User1"), "{md}");
         assert!(!md.contains("replaced with"), "{md}");
         assert!(md.contains("## Description\n\nbody"));

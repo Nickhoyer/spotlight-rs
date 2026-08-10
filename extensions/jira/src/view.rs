@@ -543,12 +543,7 @@ impl JiraView {
         let Some(detail) = reading.detail.clone() else {
             return;
         };
-        let url = self
-            .client
-            .as_ref()
-            .map(|c| c.browse_url(&detail.key))
-            .unwrap_or_default();
-        spotlight_platform_macos::clipboard::write_text(&copy::issue_markdown(&detail, &url));
+        spotlight_platform_macos::clipboard::write_text(&copy::issue_markdown(&detail));
         reading.copied = true;
         cx.notify();
 
