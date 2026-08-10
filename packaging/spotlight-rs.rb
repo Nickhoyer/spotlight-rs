@@ -21,5 +21,21 @@ cask "spotlight-rs" do
 
   app "Spotlight-rs.app"
 
+  # Restart the app across an upgrade. `brew upgrade` uninstalls the old cask
+  # before installing the new one, so `uninstall quit:` is what stops the
+  # running instance before its bundle is replaced — without it the old process
+  # survives, running from the deleted bundle, until it is manually restarted.
+  # postflight then brings the new version straight back up.
+  #
+  # This also launches the app after a plain `brew install`, which is the useful
+  # behaviour for a menu-bar agent with no Dock icon to click.
+  postflight do
+    system_command "/usr/bin/open",
+                   args: ["-a", "#{appdir}/Spotlight-rs.app"],
+                   sudo: false
+  end
+
+  uninstall quit: "com.nickolashoyer.spotlight-rs"
+
   zap trash: "~/Library/Application Support/spotlight-rs"
 end
