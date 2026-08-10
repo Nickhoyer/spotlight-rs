@@ -111,6 +111,11 @@ pub struct JiraView {
     /// (`SPOTLIGHT_JIRA_DEMO_HTML=<path>`), for headless captures — rendered
     /// without a configured client or network.
     demo_html: Option<String>,
+    /// Debug aid: an issue key to drill into on first render
+    /// (`SPOTLIGHT_JIRA_DEMO_ISSUE=SO-2522`). Unlike `demo_html` this runs the
+    /// real fetch, so a capture exercises the actual field request — the path
+    /// where a missing field looks like empty content rather than an error.
+    demo_issue: Option<String>,
     /// Bumped on each fetch so out-of-order responses can be discarded.
     generation: u64,
     focus_handle: FocusHandle,
@@ -156,6 +161,7 @@ impl JiraView {
             demo_html: std::env::var("SPOTLIGHT_JIRA_DEMO_HTML")
                 .ok()
                 .and_then(|path| std::fs::read_to_string(path).ok()),
+            demo_issue: std::env::var("SPOTLIGHT_JIRA_DEMO_ISSUE").ok(),
             generation: 0,
             focus_handle: cx.focus_handle(),
             nav: ListNav::new(),
@@ -1074,6 +1080,7 @@ impl JiraView {
             summary: "Demo issue".to_string(),
             status: "In Progress".to_string(),
             description_html: Some(html),
+            custom_fields: Vec::new(),
             comments: Vec::new(),
         };
         let style = doc_style();
@@ -1131,9 +1138,22 @@ impl Render for JiraView {
             self.focused_once = true;
         }
 
-        // Debug aid: drop straight into the reading pane with a file's HTML.
+        // Debug aids: drop straight into the reading pane, either with a
+        // file's HTML or by really fetching an issue.
         if let Some(html) = self.demo_html.take() {
             self.open_demo_reading(html, window, cx);
+        }
+        if let Some(key) = self.demo_issue.take() {
+            let issue = Issue {
+                key,
+                summary: String::new(),
+                status: String::new(),
+                status_color: models::StatusColor::Other,
+                priority: String::new(),
+                assignee: None,
+                assignee_id: None,
+            };
+            self.open_reading(&issue, window, cx);
         }
 
         // The reading pane takes over the whole panel as its own view.

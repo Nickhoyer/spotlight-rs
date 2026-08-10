@@ -4,6 +4,8 @@
 //! missing fields); [`Issue`] is our own flattened, serializable form used both
 //! for rendering and for the on-disk stale-while-revalidate cache.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 // ---- raw API shapes -------------------------------------------------------
@@ -60,15 +62,18 @@ pub struct RawAssignee {
 
 // ---- issue detail (rendered HTML) -----------------------------------------
 
-/// `GET /issue/{key}?expand=renderedFields` response. `renderedFields` holds
-/// the same fields as `fields` but with Atlassian-Document-Format bodies
-/// server-rendered to HTML strings.
+/// `GET /issue/{key}?expand=renderedFields,names` response. `renderedFields`
+/// holds the same fields as `fields` but with Atlassian-Document-Format bodies
+/// server-rendered to HTML strings; `names` maps field ids to their display
+/// names, which is the only way to label `customfield_10042`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueDetailResponse {
     #[serde(default)]
     pub fields: DetailFields,
     #[serde(rename = "renderedFields", default)]
     pub rendered: RenderedDetailFields,
+    #[serde(default)]
+    pub names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -86,6 +91,12 @@ pub struct RenderedDetailFields {
     pub description: Option<String>,
     #[serde(default)]
     pub comment: RenderedComments,
+    /// Every other field Jira rendered, by field id — this is where custom
+    /// fields arrive. Values are only strings for fields Jira has a renderer
+    /// for; everything else (Rank, Sprint, the dev-panel blob) comes through
+    /// as `null` no matter what the raw field holds.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -124,7 +135,17 @@ pub struct IssueDetail {
     pub summary: String,
     pub status: String,
     pub description_html: Option<String>,
+    /// Custom fields carrying rendered content ("Why we need this?",
+    /// "Definition of Done"), labeled and ordered by display name.
+    pub custom_fields: Vec<CustomField>,
     pub comments: Vec<CommentHtml>,
+}
+
+/// A custom field Jira rendered to HTML, with its human-readable label.
+#[derive(Debug, Clone)]
+pub struct CustomField {
+    pub name: String,
+    pub html: String,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +157,27 @@ pub struct CommentHtml {
 
 impl IssueDetail {
     pub fn from_raw(key: String, resp: IssueDetailResponse) -> Self {
+        // Custom fields worth showing are the ones Jira rendered to a
+        // non-empty string. That single rule is enough: the noisy internals
+        // (Rank, Sprint, Development) all render as `null` however they're
+        // stored, and unfilled fields render as `""`.
+        let mut custom_fields: Vec<CustomField> = resp
+            .rendered
+            .extra
+            .iter()
+            .filter(|(id, _)| id.starts_with("customfield_"))
+            .filter_map(|(id, value)| {
+                let html = value.as_str()?.trim();
+                (!html.is_empty()).then(|| CustomField {
+                    name: resp.names.get(id).cloned().unwrap_or_else(|| id.clone()),
+                    html: html.to_string(),
+                })
+            })
+            .collect();
+        // The API doesn't report the screen's field order, so sort by label to
+        // at least keep it stable between opens.
+        custom_fields.sort_by(|a, b| a.name.cmp(&b.name));
+
         // Rendered comments carry the HTML body and a human-formatted date;
         // authors come from the plain fields, zipped by index.
         let comments = resp
@@ -173,6 +215,7 @@ impl IssueDetail {
                 .rendered
                 .description
                 .filter(|d| !d.trim().is_empty()),
+            custom_fields,
             comments,
         }
     }
@@ -430,6 +473,54 @@ mod tests {
         assert_eq!(detail.comments[0].author, "Jane <Dev>");
         assert_eq!(detail.comments[0].created, "07/Aug/26 9:15 AM");
         assert_eq!(detail.comments[0].body_html, "<p>On it.</p>");
+    }
+
+    #[test]
+    fn keeps_rendered_custom_fields_and_drops_the_noise() {
+        // The exact shape a real issue returns: two rich-text fields with
+        // content, an unfilled one, and the internals — Rank and Sprint hold
+        // values but Jira renders them as null, and the dev-panel blob too.
+        let json = r#"{
+            "fields": { "summary": "s" },
+            "renderedFields": {
+                "description": "<p>d</p>",
+                "customfield_10101": "<p>When adding markets to PROD…</p>",
+                "customfield_10102": "<ul><li>Mapped ID allows custom numbers</li></ul>",
+                "customfield_10103": "",
+                "customfield_10014": null,
+                "customfield_10020": null,
+                "customfield_10000": null
+            },
+            "names": {
+                "customfield_10101": "Why we need this ?",
+                "customfield_10102": "Definition of Done",
+                "customfield_10103": "QA requirements",
+                "customfield_10014": "Rank",
+                "customfield_10020": "Sprint",
+                "customfield_10000": "Development"
+            }
+        }"#;
+        let resp: IssueDetailResponse = serde_json::from_str(json).unwrap();
+        let detail = IssueDetail::from_raw("FE-42".into(), resp);
+        let labels: Vec<&str> = detail.custom_fields.iter().map(|f| f.name.as_str()).collect();
+        // Only the two with rendered content, ordered by label.
+        assert_eq!(labels, vec!["Definition of Done", "Why we need this ?"]);
+        assert!(detail.custom_fields[0].html.starts_with("<ul>"));
+        // The description still parses alongside them.
+        assert_eq!(detail.description_html.as_deref(), Some("<p>d</p>"));
+    }
+
+    #[test]
+    fn custom_fields_fall_back_to_their_id_when_unnamed() {
+        // No `names` map (an older expand, or a field removed mid-flight):
+        // better to show the raw id than to drop the content.
+        let json = r#"{
+            "renderedFields": { "customfield_10101": "<p>x</p>" }
+        }"#;
+        let resp: IssueDetailResponse = serde_json::from_str(json).unwrap();
+        let detail = IssueDetail::from_raw("FE-42".into(), resp);
+        assert_eq!(detail.custom_fields.len(), 1);
+        assert_eq!(detail.custom_fields[0].name, "customfield_10101");
     }
 
     #[test]

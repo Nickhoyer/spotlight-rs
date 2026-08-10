@@ -41,12 +41,20 @@ pub struct DocStyle {
     pub code_bg: u32,
 }
 
-/// Compose the full document: our stylesheet, the description, then comments.
+/// Compose the full document: our stylesheet, the description, the filled-in
+/// custom fields, then comments — mirroring how the issue reads on the web.
 pub fn issue_document(detail: &IssueDetail, style: &DocStyle) -> String {
     let mut doc = stylesheet(style);
     match &detail.description_html {
         Some(html) => doc.push_str(&adapt_inline_colors(html, style)),
         None => doc.push_str("<p class=\"empty\">No description.</p>"),
+    }
+    for field in &detail.custom_fields {
+        doc.push_str(&format!(
+            "<div class=\"meta\"><b>{}</b></div>{}",
+            escape_html(&field.name),
+            adapt_inline_colors(&field.html, style)
+        ));
     }
     if !detail.comments.is_empty() {
         doc.push_str("<hr>");
@@ -340,7 +348,7 @@ fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CommentHtml, IssueDetail};
+    use crate::models::{CommentHtml, CustomField, IssueDetail};
 
     /// The app's dark palette, near enough for contrast assertions.
     const DARK: DocStyle = DocStyle {
@@ -358,6 +366,7 @@ mod tests {
             summary: "Build the thing".into(),
             status: "In Progress".into(),
             description_html: description.map(str::to_string),
+            custom_fields: Vec::new(),
             comments,
         }
     }
@@ -384,6 +393,32 @@ mod tests {
         // The stylesheet carries the theme palette, not a white page.
         assert!(doc.contains("color: #e8ecf4"));
         assert!(!doc.contains("#ffffff"));
+    }
+
+    #[test]
+    fn custom_fields_are_labeled_and_adapted() {
+        let mut d = detail(Some("<p>desc</p>"), Vec::new());
+        d.custom_fields = vec![
+            CustomField {
+                name: "Why we need this ?".into(),
+                html: r#"<p style="color: #172b4d">Parity with UAT</p>"#.into(),
+            },
+            CustomField {
+                name: "Definition of Done".into(),
+                html: "<ul><li>Custom ids allowed</li></ul>".into(),
+            },
+        ];
+        let doc = issue_document(&d, &DARK);
+        // Labels use the same muted treatment as the comment bylines, and the
+        // field's own HTML follows.
+        assert!(doc.contains(r#"<div class="meta"><b>Why we need this ?</b></div>"#), "{doc}");
+        assert!(doc.contains("<li>Custom ids allowed</li>"), "{doc}");
+        // Field bodies go through the same inline-color adaptation as the
+        // description — pasted ink here would be just as invisible.
+        assert!(!doc.contains("#172b4d"), "{doc}");
+        // They sit after the description and before any comments.
+        let desc = doc.find("<p>desc</p>").unwrap();
+        assert!(doc.find("Why we need this ?").unwrap() > desc);
     }
 
     #[test]

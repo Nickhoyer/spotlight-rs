@@ -77,11 +77,12 @@ impl JiraClient {
     /// `renderedFields` only carries entries for fields named in `fields`, so
     /// anything missing from that list comes back empty however the `expand`
     /// is written — which is exactly how the description silently rendered as
-    /// "No description" while comments came through.
+    /// "No description" while comments came through. `*all` sidesteps that
+    /// class of bug entirely and is what makes custom fields available;
+    /// `names` is what lets us label `customfield_10042`.
     fn detail_url(&self, key: &str) -> String {
         format!(
-            "{}/rest/api/3/issue/{}?fields=summary,status,description,comment\
-             &expand=renderedFields",
+            "{}/rest/api/3/issue/{}?fields=*all&expand=renderedFields,names",
             self.base_url, key
         )
     }
@@ -176,15 +177,16 @@ mod tests {
     use super::{normalize_base, JiraClient};
 
     #[test]
-    fn detail_request_asks_for_every_rendered_field_it_reads() {
+    fn detail_request_asks_for_every_field_the_pane_reads() {
         let url = JiraClient::new("acme", "me@example.com", "token").detail_url("SO-2522");
         assert!(url.starts_with("https://acme.atlassian.net/rest/api/3/issue/SO-2522?"));
+        // An unrequested field comes back empty rather than erroring, which is
+        // how the description silently vanished — `*all` is what prevents a
+        // repeat, and it's the only way to see custom fields at all.
+        assert!(url.contains("fields=*all"), "{url}");
         assert!(url.contains("expand=renderedFields"), "{url}");
-        // Every field the reading pane renders must be requested by name —
-        // an unlisted field comes back empty rather than erroring.
-        for field in ["summary", "status", "description", "comment"] {
-            assert!(url.contains(field), "{field} not requested: {url}");
-        }
+        // Without `names`, custom fields have no label but their raw id.
+        assert!(url.contains("names"), "{url}");
     }
 
     #[test]
