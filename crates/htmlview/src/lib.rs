@@ -1,6 +1,8 @@
 //! Headless HTML rendering via Blitz (Servo's Stylo styles + Taffy layout +
 //! CPU Vello painting), shared by extensions that show remote HTML in-app
-//! (Gmail message bodies, Jira issue descriptions). No JavaScript, and by
+//! (Gmail message bodies, Jira issue descriptions). Documents render light or
+//! dark per [`Scheme`] — email brings its own white-page palette, while
+//! documents we style ourselves match the app. No JavaScript, and by
 //! default no network provider — remote images and trackers are never fetched
 //! unless the caller explicitly opts in (`load_images`), which grants http(s)
 //! GETs only. An optional `Authorization` header is sent with those GETs, and
@@ -51,6 +53,51 @@ pub struct RenderOptions {
     /// `Authorization` header value sent with image fetches — but only to
     /// requests on `base_url`'s origin (scheme + host + port).
     pub auth: Option<String>,
+    /// What the canvas is painted on, and which way the document resolves
+    /// `prefers-color-scheme` and UA colors.
+    pub scheme: Scheme,
+}
+
+/// Which way to render a document's canvas.
+///
+/// The distinction is who owns the document's colors. Email supplies its own,
+/// written for a white page, so it must render [`Light`](Scheme::Light) — a
+/// dark canvas would leave dark author text on a dark background. Where *we*
+/// author the stylesheet (Jira's rendered fields carry structure and class
+/// hooks, not a palette), [`Dark`](Scheme::Dark) lets the document match the
+/// app instead of sitting in a white box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// Paint on white and resolve as a light UI.
+    Light,
+    /// Paint on `background` and inherit `text` (both `0xRRGGBB`), resolving
+    /// as a dark UI.
+    ///
+    /// `text` is not optional because blitz's UA stylesheet keeps its black
+    /// default text color no matter what `color-scheme` says — a dark canvas
+    /// without an inherited light color renders black-on-black.
+    Dark { background: u32, text: u32 },
+}
+
+impl Scheme {
+    /// The `html { … }` declarations that establish the canvas.
+    fn css_canvas(self) -> String {
+        match self {
+            Scheme::Light => "background: #ffffff; color-scheme: light;".to_string(),
+            Scheme::Dark { background, text } => format!(
+                "background: #{:06x}; color: #{:06x}; color-scheme: dark;",
+                background & 0xff_ffff,
+                text & 0xff_ffff
+            ),
+        }
+    }
+
+    fn color_scheme(self) -> ColorScheme {
+        match self {
+            Scheme::Light => ColorScheme::Light,
+            Scheme::Dark { .. } => ColorScheme::Dark,
+        }
+    }
 }
 
 /// An absolute link box in logical (CSS-pixel) document coordinates.
@@ -263,19 +310,21 @@ fn build_and_render(
     html: &str,
     opts: &RenderOptions,
 ) -> Result<(HtmlDocument, RenderedHtml, Vec<LinkBox>)> {
-    // Documents render on white regardless of app theme; inject a base style
-    // (author styles still override the backgrounds). The border-collapse
-    // override neutralizes a blitz bug where `border-collapse: collapse` —
-    // boilerplate in email CSS resets, both in stylesheets and inline on
-    // `display:table` divs, hence the universal selector — paints phantom
-    // thick black borders on borderless tables; `separate` is visually
-    // equivalent for them.
+    // Base style, injected first so author styles still win on everything but
+    // the canvas. `color-scheme` is declared as well as passed to the viewport
+    // so UA-derived colors (form controls, default text) follow the scheme.
+    // The border-collapse override neutralizes a blitz bug where
+    // `border-collapse: collapse` — boilerplate in email CSS resets, both in
+    // stylesheets and inline on `display:table` divs, hence the universal
+    // selector — paints phantom thick black borders on borderless tables;
+    // `separate` is visually equivalent for them.
     let html = format!(
         "<style>\
-         html {{ background: #ffffff; }} body {{ margin: 8px; }}\
+         html {{ {canvas} }} body {{ margin: 8px; }}\
          * {{ border-collapse: separate !important; }}\
-         </style>{}",
-        sanitize(html)
+         </style>{body}",
+        canvas = opts.scheme.css_canvas(),
+        body = sanitize(html)
     );
     let scale = opts.scale;
 
@@ -295,7 +344,7 @@ fn build_and_render(
                 opts.logical_width * (scale as u32),
                 800 * (scale as u32),
                 scale as f32,
-                ColorScheme::Light,
+                opts.scheme.color_scheme(),
             )),
             ..Default::default()
         },
@@ -411,10 +460,10 @@ fn collect_links(doc: &BaseDocument) -> Vec<LinkBox> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_html, RenderOptions};
+    use super::{render_html, RenderOptions, Scheme};
     use std::collections::HashSet;
 
-    /// Options matching the old Gmail defaults the tests were written against.
+    /// Options matching the Gmail defaults the tests were written against.
     fn opts(logical_width: u32, scale: f64, load_images: bool) -> RenderOptions {
         RenderOptions {
             logical_width,
@@ -422,6 +471,7 @@ mod tests {
             load_images,
             base_url: "https://mail.google.com/".to_string(),
             auth: None,
+            scheme: Scheme::Light,
         }
     }
 
@@ -535,6 +585,42 @@ mod tests {
     }
 
     #[test]
+    fn dark_scheme_paints_the_requested_canvas() {
+        // A document that sets no background of its own: every pixel is either
+        // the canvas or the text drawn on it, so the corner proves the canvas
+        // and the mean proves we didn't paint a white page and darken nothing.
+        let html = "<p>Dark mode</p>";
+        let (rendered, _hit) = render_html(
+            html,
+            RenderOptions {
+                scheme: Scheme::Dark {
+                    background: 0x23252c,
+                    text: 0xe8ecf4,
+                },
+                ..opts(400, 1.0, false)
+            },
+        )
+        .unwrap();
+        // BGRA, opaque.
+        assert_eq!(&rendered.bgra[0..4], &[0x2c, 0x25, 0x23, 255]);
+        assert!(
+            transparent_pct(&rendered) < 1.0,
+            "paint was suppressed: {:.1}% transparent",
+            transparent_pct(&rendered)
+        );
+        // The scheme's text color is inherited, so the copy is light-on-dark:
+        // some pixel must be brighter than the canvas. (Blitz's UA stylesheet
+        // would otherwise paint it black — invisible here.)
+        let brightest = rendered
+            .bgra
+            .chunks_exact(4)
+            .map(|px| px[0].max(px[1]).max(px[2]))
+            .max()
+            .unwrap_or(0);
+        assert!(brightest > 0x80, "no light text painted (max {brightest:#x})");
+    }
+
+    #[test]
     fn auth_header_stays_on_base_origin() {
         // Two servers = two origins. The image on the base origin gets the
         // Authorization header; the cross-origin one must not see it.
@@ -552,6 +638,7 @@ mod tests {
                 load_images: true,
                 base_url: format!("http://127.0.0.1:{same_port}/"),
                 auth: Some("Basic c2VjcmV0".to_string()),
+                scheme: Scheme::Light,
             },
         )
         .unwrap();

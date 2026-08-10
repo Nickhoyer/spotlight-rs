@@ -178,68 +178,6 @@ impl IssueDetail {
     }
 }
 
-/// HTML-escape a text fragment interpolated into [`issue_document`].
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Compose one HTML document from an issue's rendered description + comments,
-/// for the shared Blitz renderer. Jira's rendered fields are bare semantic
-/// HTML with class hooks but no styles, so a small stylesheet approximating
-/// Jira's own look is prepended (the renderer paints on white).
-pub fn issue_document(detail: &IssueDetail) -> String {
-    let mut doc = String::from(
-        "<style>\
-         body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;\
-                font-size: 14px; line-height: 1.55; color: #172b4d; }\
-         h1,h2,h3,h4 { line-height: 1.3; }\
-         a { color: #0052cc; }\
-         img { max-width: 100%; }\
-         code, pre, tt { font-family: Menlo, Monaco, monospace; font-size: 12px;\
-                         background: #f4f5f7; border-radius: 3px; }\
-         pre { padding: 8px 12px; }\
-         blockquote { border-left: 2px solid #dfe1e6; margin-left: 0;\
-                      padding-left: 12px; color: #5e6c84; }\
-         table { border-collapse: separate; }\
-         th, td { border: 1px solid #dfe1e6; padding: 4px 8px; }\
-         hr { border: none; border-top: 1px solid #dfe1e6; margin: 20px 0; }\
-         .meta { font-size: 12px; color: #5e6c84; margin: 16px 0 4px; }\
-         .empty { color: #5e6c84; font-style: italic; }\
-         </style>",
-    );
-    match &detail.description_html {
-        Some(html) => doc.push_str(html),
-        None => doc.push_str("<p class=\"empty\">No description.</p>"),
-    }
-    if !detail.comments.is_empty() {
-        doc.push_str("<hr>");
-        let n = detail.comments.len();
-        doc.push_str(&format!(
-            "<div class=\"meta\"><b>{n} comment{}</b></div>",
-            if n == 1 { "" } else { "s" }
-        ));
-        for comment in &detail.comments {
-            doc.push_str(&format!(
-                "<div class=\"meta\"><b>{}</b> · {}</div>{}",
-                escape_html(&comment.author),
-                escape_html(&comment.created),
-                comment.body_html
-            ));
-        }
-    }
-    doc
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Account {
     #[serde(rename = "accountId", default)]
@@ -464,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_issue_detail_and_composes_document() {
+    fn parses_issue_detail() {
         let json = r#"{
             "key": "FE-42",
             "fields": {
@@ -486,25 +424,21 @@ mod tests {
         assert_eq!(detail.summary, "Build the thing");
         assert_eq!(detail.status, "In Progress");
         assert_eq!(detail.description_html.as_deref(), Some("<p>Do the <b>thing</b></p>"));
+        // The rendered comment's HTML body and human date, zipped with the
+        // author from the plain fields.
         assert_eq!(detail.comments.len(), 1);
-
-        let doc = issue_document(&detail);
-        assert!(doc.contains("<p>Do the <b>thing</b></p>"));
-        // Author names are escaped; rendered bodies pass through as-is.
-        assert!(doc.contains("Jane &lt;Dev&gt;"));
-        assert!(doc.contains("<p>On it.</p>"));
-        assert!(doc.contains("07/Aug/26 9:15 AM"));
+        assert_eq!(detail.comments[0].author, "Jane <Dev>");
+        assert_eq!(detail.comments[0].created, "07/Aug/26 9:15 AM");
+        assert_eq!(detail.comments[0].body_html, "<p>On it.</p>");
     }
 
     #[test]
-    fn issue_document_without_description_or_comments() {
+    fn blank_description_reads_as_absent() {
         let json = r#"{ "key": "X-1", "fields": {}, "renderedFields": { "description": "  " } }"#;
         let resp: IssueDetailResponse = serde_json::from_str(json).unwrap();
         let detail = IssueDetail::from_raw("X-1".into(), resp);
         assert!(detail.description_html.is_none());
-        let doc = issue_document(&detail);
-        assert!(doc.contains("No description."));
-        assert!(!doc.contains("comment"));
+        assert!(detail.comments.is_empty());
     }
 
     #[test]

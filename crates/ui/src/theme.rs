@@ -71,3 +71,41 @@ pub fn hover() -> Rgba {
 pub fn hover_strong() -> Rgba {
     rgba(HOVER_STRONG)
 }
+
+/// The `0xRRGGBB` part of an `0xRRGGBBAA` token — the color it resolves to over
+/// an identical backdrop.
+pub fn opaque_rgb(rgba: u32) -> u32 {
+    rgba >> 8
+}
+
+/// Composite an `0xRRGGBBAA` wash over an opaque `0xRRGGBB` base, giving the
+/// solid color the pair resolves to.
+///
+/// Anything rendered as an image (the HTML reading panes) can't participate in
+/// the panel's alpha blending, so it needs the flattened color rather than the
+/// translucent token.
+pub fn wash(base_rgb: u32, over_rgba: u32) -> u32 {
+    let alpha = (over_rgba & 0xff) as f32 / 255.0;
+    let mix = |shift: u32| {
+        let base = ((base_rgb >> shift) & 0xff) as f32;
+        let over = ((over_rgba >> (shift + 8)) & 0xff) as f32;
+        (base + (over - base) * alpha).round().clamp(0.0, 255.0) as u32
+    };
+    mix(16) << 16 | mix(8) << 8 | mix(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wash_lifts_the_panel_toward_the_overlay() {
+        // A fully opaque wash replaces the base; a zero-alpha one is a no-op.
+        assert_eq!(wash(0x12141c, 0xff_ffff_ff), 0xffffff);
+        assert_eq!(wash(0x12141c, 0xff_ffff_00), 0x12141c);
+        // The icon-tile wash over the panel lands a hair lighter than it.
+        let lifted = wash(opaque_rgb(PANEL_BG), ICON_BG);
+        assert!(lifted > opaque_rgb(PANEL_BG), "{lifted:#08x}");
+        assert_eq!(lifted, 0x23252c);
+    }
+}

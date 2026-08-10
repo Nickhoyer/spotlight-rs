@@ -20,7 +20,7 @@ use gpui::{
 use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
-use spotlight_htmlview::{HitTester, RenderOptions};
+use spotlight_htmlview::{HitTester, RenderOptions, Scheme};
 
 use crate::client::{GmailClient, InboxFilter, INBOX_URL};
 use crate::models::{self, Email, Inbox, MailBody};
@@ -381,6 +381,9 @@ impl GmailView {
                                 // not fail (nothing is fetched without opt-in).
                                 base_url: "https://mail.google.com/".to_string(),
                                 auth: None,
+                                // Emails bring their own palette, written for
+                                // a white page.
+                                scheme: Scheme::Light,
                             },
                         )
                     })

@@ -18,11 +18,12 @@ use gpui::{
 };
 
 use spotlight_config::{AppConfig, Recent};
-use spotlight_htmlview::{HitTester, RenderOptions};
+use spotlight_htmlview::{HitTester, RenderOptions, Scheme};
 use spotlight_ui::list::ListNav;
 use spotlight_ui::theme;
 
 use crate::client::JiraClient;
+use crate::document::{self, DocStyle};
 use crate::models::{self, Account, Issue};
 use crate::JiraConfig;
 
@@ -37,6 +38,27 @@ fn read_width() -> f32 {
 
 /// Arrow-key scroll step in the reading pane.
 const SCROLL_STEP: f32 = 80.0;
+
+/// The palette the issue document renders with, derived from the app's theme
+/// tokens so the reading pane matches the panel around it.
+///
+/// The tokens are translucent, but a rendered image can't blend with the panel
+/// the way an element would, so each is flattened to the solid color it
+/// resolves to. The surface itself is the panel lifted by the same wash the
+/// app puts under icon tiles — a subtle card rather than a white box — and code
+/// blocks sit *back* at the panel color, so they read as recessed.
+fn doc_style() -> DocStyle {
+    let panel = theme::opaque_rgb(theme::PANEL_BG);
+    let background = theme::wash(panel, theme::ICON_BG);
+    DocStyle {
+        background,
+        text: theme::TEXT,
+        muted: theme::MUTED,
+        link: theme::ACCENT,
+        border: theme::wash(background, theme::DIVIDER),
+        code_bg: panel,
+    }
+}
 
 /// The drill-in reading pane's content state.
 enum ReadState {
@@ -378,7 +400,8 @@ impl JiraView {
                 .background_executor()
                 .spawn(async move {
                     let detail = client.issue_detail(&key)?;
-                    let doc = models::issue_document(&detail);
+                    let style = doc_style();
+                    let doc = document::issue_document(&detail, &style);
                     // Load images by default: this is the user's own Jira
                     // site, not tracker-laden third-party mail. Auth rides
                     // along (same-origin only) so attachments resolve.
@@ -390,6 +413,12 @@ impl JiraView {
                             load_images: true,
                             base_url: format!("{}/", client.base_url()),
                             auth: Some(client.auth_header().to_string()),
+                            // We own this document's stylesheet, so it renders
+                            // in the app's palette rather than on white.
+                            scheme: Scheme::Dark {
+                                background: style.background,
+                                text: style.text,
+                            },
                         },
                     )?;
                     anyhow::Ok((detail, rendered))
@@ -973,11 +1002,11 @@ impl JiraView {
                     .h(px(*logical_h))
                     .rounded_lg()
                     .overflow_hidden()
-                    // White under the image: the document renders on white,
-                    // and if the image itself fails to paint this shows a
-                    // white card (image problem) instead of nothing (layout
-                    // problem).
-                    .bg(gpui::rgb(0xffffff))
+                    // The document's own canvas color under the image, so a
+                    // failed paint shows an empty card (image problem) rather
+                    // than nothing (layout problem) — and so the rounded
+                    // corners the image can't draw still read as the surface.
+                    .bg(gpui::rgb(doc_style().background))
                     .child(
                         img(ImageSource::Render(image.clone()))
                             .w(px(*logical_w))
@@ -1047,7 +1076,8 @@ impl JiraView {
             description_html: Some(html),
             comments: Vec::new(),
         };
-        let doc = models::issue_document(&detail);
+        let style = doc_style();
+        let doc = document::issue_document(&detail, &style);
         let scale = window.scale_factor() as f64;
         let width = read_width() as u32;
         cx.spawn(async move |this, cx| {
@@ -1062,6 +1092,10 @@ impl JiraView {
                             load_images: false,
                             base_url: "https://example.atlassian.net/".to_string(),
                             auth: None,
+                            scheme: Scheme::Dark {
+                                background: style.background,
+                                text: style.text,
+                            },
                         },
                     )
                 })
