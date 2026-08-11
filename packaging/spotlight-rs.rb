@@ -21,18 +21,35 @@ cask "spotlight-rs" do
 
   app "Spotlight-rs.app"
 
-  # Restart the app across an upgrade. `brew upgrade` uninstalls the old cask
-  # before installing the new one, so `uninstall quit:` is what stops the
-  # running instance before its bundle is replaced — without it the old process
-  # survives, running from the deleted bundle, until it is manually restarted.
-  # postflight then brings the new version straight back up.
+  # Launch on a *first install only*. This is a menu-bar agent with no Dock
+  # icon, so there is otherwise nothing for the user to click after installing.
   #
-  # This also launches the app after a plain `brew install`, which is the useful
-  # behaviour for a menu-bar agent with no Dock icon to click.
+  # Upgrades are deliberately left alone. `uninstall quit:` stops the running
+  # instance before its bundle is replaced, and Homebrew reopens every bundle id
+  # it quit once the upgrade completes — so the restart already happens without
+  # help from here.
+  #
+  # Opening the app from postflight *breaks* that upgrade path. postflight runs
+  # inside install_artifacts, before Homebrew copies the old bundle's
+  # com.apple.quarantine user-approved flag onto the new one; macOS rewrites the
+  # same attribute during the app's first launch. The two writes race, which is
+  # what produces
+  #
+  #   Warning: Homebrew couldn't inherit spotlight-rs's quarantine approval so
+  #   macOS will prompt at next launch.
+  #
+  # and hands the user the Gatekeeper prompt the inheritance exists to suppress.
+  #
+  # An upgrade renames the predecessor's staged directory to
+  # `<caskroom>/<old version>.upgrading` and only purges it once the new cask is
+  # fully installed, so that directory existing at postflight time is what
+  # distinguishes an upgrade from a first install.
   postflight do
-    system_command "/usr/bin/open",
-                   args: ["-a", "#{appdir}/Spotlight-rs.app"],
-                   sudo: false
+    if caskroom_path.children.none? { |path| path.basename.to_s.end_with?(".upgrading") }
+      system_command "/usr/bin/open",
+                     args: ["-a", "#{appdir}/Spotlight-rs.app"],
+                     sudo: false
+    end
   end
 
   uninstall quit: "com.nickolashoyer.spotlight-rs"
