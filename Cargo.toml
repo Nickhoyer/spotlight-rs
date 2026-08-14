@@ -13,6 +13,7 @@ members = [
     "extensions/gmail",
     "extensions/jira",
     "extensions/llm",
+    "extensions/scripts",
 ]
 
 [workspace.package]
@@ -77,6 +78,7 @@ ext-clipboard = { path = "extensions/clipboard" }
 ext-gmail = { path = "extensions/gmail" }
 ext-jira = { path = "extensions/jira" }
 ext-llm = { path = "extensions/llm" }
+ext-scripts = { path = "extensions/scripts" }
 
 # stylo's ToCss derive emits untyped `Ok(())?` whose error-type inference
 # breaks when anything else in the graph impls `From<..> for fmt::Error`

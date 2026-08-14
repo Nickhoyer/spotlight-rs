@@ -32,6 +32,8 @@ fn main() {
     registry.register(Arc::new(CalculatorExtension));
     // Cached Jira issues are searchable from the main bar.
     registry.register(Arc::new(ext_jira::JiraSearch));
+    // Small one-shot automations, each a single searchable entry.
+    registry.register(Arc::new(ext_scripts::ScriptsExtension));
     // Clipboard history is searchable from the main bar (keyword: `clip`).
     registry.register(clipboard.extension());
     // A dynamic "Ask AI" entry that always appears (ranked very low) and opens

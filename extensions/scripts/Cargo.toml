@@ -1,0 +1,11 @@
+[package]
+name = "ext-scripts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spotlight-core.workspace = true
+spotlight-platform-macos.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true

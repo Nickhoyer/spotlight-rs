@@ -17,3 +17,4 @@ ext-clipboard.workspace = true
 ext-gmail.workspace = true
 ext-jira.workspace = true
 ext-llm.workspace = true
+ext-scripts.workspace = true
