@@ -103,7 +103,12 @@ impl MusicView {
             let _ = this.update(cx, |this, cx| {
                 this.daily_running = false;
                 match result {
-                    Ok(_) => this.refresh(cx),
+                    // The server answers 202 and generates in the background
+                    // (takes a few minutes); playlists appear on a later refresh.
+                    Ok(_) => {
+                        this.health = Some("daily generation started — refresh in a few minutes".into());
+                        this.error = None;
+                    }
                     Err(e) => this.error = Some(format!("Daily run failed: {e}")),
                 }
                 cx.notify();
