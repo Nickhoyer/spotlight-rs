@@ -14,11 +14,13 @@
 
 mod cleanup;
 mod client;
+mod scrobbler;
 mod search;
 mod settings_tab;
 mod view;
 
 pub use cleanup::spawn_cleanup_worker;
+pub use scrobbler::spawn_scrobble_worker;
 pub use search::MusicSearch;
 
 use gpui::prelude::*;

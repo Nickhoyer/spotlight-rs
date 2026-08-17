@@ -31,6 +31,9 @@ fn main() {
     // Apple Music API cannot delete playlists; this Mac is the only actor that
     // can). No-ops until Settings → Music is configured.
     ext_music::spawn_cleanup_worker();
+    // Apple's cloud listening history doesn't record station playback, so the
+    // Mac reports what Music.app actually plays to the ampm server.
+    ext_music::spawn_scrobble_worker();
 
     let mut registry = Registry::new();
     registry.register(Arc::new(AppsExtension::new()));

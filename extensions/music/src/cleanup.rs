@@ -85,15 +85,18 @@ fn music_is_running() -> bool {
 /// registry ever reach this, so there is no risk of touching user playlists.
 fn delete_playlist(name: &str) -> String {
     let escaped = escape_applescript(name);
+    // `with timeout` keeps a busy Music from stalling the sweep for minutes.
     let script = format!(
-        "tell application \"Music\"\n\
-           if (exists playlist \"{escaped}\") then\n\
-             delete playlist \"{escaped}\"\n\
-             return \"deleted\"\n\
-           else\n\
-             return \"not_found\"\n\
-           end if\n\
-         end tell"
+        "with timeout of 30 seconds\n\
+           tell application \"Music\"\n\
+             if (exists playlist \"{escaped}\") then\n\
+               delete playlist \"{escaped}\"\n\
+               return \"deleted\"\n\
+             else\n\
+               return \"not_found\"\n\
+             end if\n\
+           end tell\n\
+         end timeout"
     );
     match Command::new("/usr/bin/osascript").arg("-e").arg(&script).output() {
         Ok(out) if out.status.success() => {

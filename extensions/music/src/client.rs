@@ -104,6 +104,15 @@ impl MusicClient {
         Ok(serde_json::from_value(v.get("scrobbles").cloned().unwrap_or_default()).unwrap_or_default())
     }
 
+    /// Report plays captured from Music.app; the server dedups and submits.
+    pub fn ingest_scrobbles(&self, plays: &[crate::scrobbler::PendingPlay]) -> anyhow::Result<Value> {
+        self.post(
+            "/scrobbles/ingest",
+            json!({ "plays": plays }),
+            Duration::from_secs(30),
+        )
+    }
+
     pub fn cleanup_pending(&self) -> anyhow::Result<Vec<(i64, String)>> {
         let v = self.get("/cleanup/pending")?;
         Ok(v.get("pending")
