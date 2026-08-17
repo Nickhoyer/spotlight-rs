@@ -2,12 +2,15 @@ name: release
 
 # Release on push to main. If there are Conventional-Commit changes since the
 # last tag that warrant a release (feat / fix / perf / breaking), compute the next
-# version, tag it, build the app on a macOS runner, publish a GitHub release, and
+# version, build the app on a macOS runner, publish a tagged GitHub release, and
 # bump the Homebrew cask in the tap. Pushes with only chore/docs/ci/etc. do
 # nothing. macOS runners are free for public repos.
 on:
   push:
     branches: [main]
+  # Manual trigger, for re-driving a release that died on something transient
+  # (an API 5xx, a notarization hiccup) without needing an empty commit.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -147,12 +150,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           V="${{ steps.ver.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "v$V" -m "v$V"
-          git push origin "v$V"
-          gh release create "v$V" dist/Spotlight-rs.zip --title "v$V" --generate-notes
+
+          # `--target` has the release API cut the tag, so the tag and the
+          # release land in one call. Pushing the tag separately beforehand
+          # meant any failure here left a tag with no release behind — which
+          # both burns the version number and makes a re-run fail on
+          # "tag already exists" rather than retrying cleanly.
+          #
+          # Re-entrant either way: if an earlier attempt got as far as creating
+          # the release, attach the asset to that one instead of recreating it.
+          publish() {
+            if gh release view "v$V" >/dev/null 2>&1; then
+              gh release upload "v$V" dist/Spotlight-rs.zip --clobber
+            else
+              gh release create "v$V" dist/Spotlight-rs.zip \
+                --title "v$V" --generate-notes --target "$GITHUB_SHA"
+            fi
+          }
+
+          # The build and notarization are already ~4 minutes sunk by this
+          # point, so a transient 5xx from the API is worth waiting out rather
+          # than redoing.
+          for attempt in 1 2 3; do
+            if publish; then exit 0; fi
+            echo "publish failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::could not publish v$V after 3 attempts"
+          exit 1
 
       - name: Checkout Homebrew tap
         if: steps.ver.outputs.release == 'true' && env.TAP_DEPLOY_KEY != ''
