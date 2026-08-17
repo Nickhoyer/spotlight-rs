@@ -13,6 +13,7 @@ members = [
     "extensions/gmail",
     "extensions/jira",
     "extensions/llm",
+    "extensions/music",
     "extensions/scripts",
 ]
 
@@ -78,6 +79,7 @@ ext-clipboard = { path = "extensions/clipboard" }
 ext-gmail = { path = "extensions/gmail" }
 ext-jira = { path = "extensions/jira" }
 ext-llm = { path = "extensions/llm" }
+ext-music = { path = "extensions/music" }
 ext-scripts = { path = "extensions/scripts" }
 
 # stylo's ToCss derive emits untyped `Ok(())?` whose error-type inference

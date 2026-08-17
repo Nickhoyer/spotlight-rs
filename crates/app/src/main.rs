@@ -27,11 +27,18 @@ fn main() {
     // its background monitor here; its search/panel/settings all read from it.
     let clipboard = ext_clipboard::Clipboard::new();
 
+    // Hourly Music.app playlist-cleanup sweep for the ampm server (the official
+    // Apple Music API cannot delete playlists; this Mac is the only actor that
+    // can). No-ops until Settings → Music is configured.
+    ext_music::spawn_cleanup_worker();
+
     let mut registry = Registry::new();
     registry.register(Arc::new(AppsExtension::new()));
     registry.register(Arc::new(CalculatorExtension));
     // Cached Jira issues are searchable from the main bar.
     registry.register(Arc::new(ext_jira::JiraSearch));
+    // `radio <track>` typeahead against the ampm server.
+    registry.register(Arc::new(ext_music::MusicSearch));
     // Small one-shot automations, each a single searchable entry.
     registry.register(Arc::new(ext_scripts::ScriptsExtension));
     // Clipboard history is searchable from the main bar (keyword: `clip`).
@@ -46,12 +53,14 @@ fn main() {
         panels: vec![
             ext_jira::panel_entry(),
             ext_gmail::panel_entry(),
+            ext_music::panel_entry(),
             clipboard.panel_entry(),
             ext_llm::panel_entry(),
         ],
         settings_tabs: vec![
             ext_jira::settings_tab(),
             ext_gmail::settings_tab(),
+            ext_music::settings_tab(),
             clipboard.settings_tab(),
             ext_llm::settings_tab(),
         ],

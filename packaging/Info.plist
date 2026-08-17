@@ -26,5 +26,10 @@
 	<string>13.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<!-- ext-music's cleanup worker scripts Music.app (deletes stale generated
+	     playlists queued by the ampm server). Triggers the Automation TCC
+	     prompt on first use. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Spotlight-rs cleans up expired auto-generated Apple Music playlists via the Music app.</string>
 </dict>
 </plist>
