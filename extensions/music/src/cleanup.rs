@@ -73,7 +73,9 @@ fn run_once(force: bool) -> anyhow::Result<CleanupOutcome> {
     Ok(CleanupOutcome::Ran)
 }
 
-fn music_is_running() -> bool {
+/// Whether Music.app is already running. Every AppleScript in this extension
+/// gates on this: `tell application "Music"` launches it otherwise.
+pub(crate) fn music_is_running() -> bool {
     Command::new("/usr/bin/pgrep")
         .args(["-x", "Music"])
         .output()

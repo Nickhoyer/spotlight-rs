@@ -2055,6 +2055,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "gpui",
+ "image",
  "serde",
  "serde_json",
  "spotlight-config",

@@ -136,6 +136,56 @@ pub struct AutocompleteProvider {
     pub suggest: Arc<dyn Fn(AutocompleteRequest) -> Option<Suggestions> + Send + Sync>,
 }
 
+/// A live "now playing" state source contributed by an extension, rendered as a
+/// card at the top of Home.
+///
+/// Deliberately data-only rather than an [`AnyView`]: the shell owns the layout,
+/// the Home height math, the arrow navigation and the selection pill, and none
+/// of those three can reach inside a foreign view — Home's navigation is
+/// hand-wired rather than focus-based, and the pill is drawn by the shell from
+/// a [`gpui::ScrollHandle`] it holds itself. The extension owns polling,
+/// artwork and playback control.
+pub struct NowPlayingSource {
+    /// Current state, or `None` when nothing is loaded (the card is hidden).
+    /// Read once per frame on the UI thread, so it must be a cheap in-memory
+    /// read — never I/O.
+    pub snapshot: Arc<dyn Fn() -> Option<NowPlayingSnapshot> + Send + Sync>,
+    /// "Home is on screen": poll at an interactive rate for the next few
+    /// seconds. Lets the source stay completely idle while the launcher is
+    /// closed instead of polling around the clock.
+    pub poke: Arc<dyn Fn() + Send + Sync>,
+    /// Run a transport command. Must return immediately (the work happens on
+    /// the source's own thread).
+    pub control: Arc<dyn Fn(Transport) + Send + Sync>,
+}
+
+/// One observation of what the music player is doing, as the shell sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NowPlayingSnapshot {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    /// True only while actually playing; paused still shows the card, because a
+    /// card that vanishes the instant you hit pause reads as a bug.
+    pub playing: bool,
+    pub duration_secs: f64,
+    pub position_secs: f64,
+    /// When `position_secs` was sampled, so the shell can interpolate the
+    /// progress bar between the source's polls.
+    pub sampled_at: Instant,
+    /// Path to a small PNG of the track artwork, or `None` (radio and streams
+    /// frequently have none).
+    pub artwork: Option<PathBuf>,
+}
+
+/// A transport command sent back to the [`NowPlayingSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    PlayPause,
+    Next,
+    Prev,
+}
+
 /// GPUI-aware extension registrations, passed to [`run`] alongside the
 /// (GPUI-free) [`Registry`].
 #[derive(Default)]
@@ -147,6 +197,8 @@ pub struct UiExtensions {
     pub menu_items: Vec<MenuItem>,
     /// Optional inline AI autocomplete + "Ask AI" suggestion source.
     pub autocomplete: Option<AutocompleteProvider>,
+    /// Optional now-playing card shown at the top of Home while music is loaded.
+    pub now_playing: Option<NowPlayingSource>,
 }
 
 /// Which screen the launcher is currently showing.
@@ -165,10 +217,46 @@ enum Screen {
 /// Keyboard selection on the Home screen. Recents are a horizontal strip
 /// (Left/Right) and shortcuts a vertical list (Up/Down); Down/Up cross between.
 /// `Shortcuts(i)` indexes panels first, then the trailing Settings entry.
+/// `NowPlaying(i)` indexes the transport row: 0 previous, 1 play/pause, 2 next.
 #[derive(Clone, Copy, PartialEq)]
 enum HomeSel {
+    NowPlaying(usize),
     Recents(usize),
     Shortcuts(usize),
+}
+
+/// The Home selection an arrow key moves to. A free function so the arm
+/// ordering — which is what makes Up prefer Recents over the now-playing card —
+/// can be tested without a window.
+fn next_home_sel(
+    sel: HomeSel,
+    key: &str,
+    recents: usize,
+    shortcuts: usize,
+    np: bool,
+) -> HomeSel {
+    match (sel, key) {
+        (HomeSel::NowPlaying(i), "right") => HomeSel::NowPlaying((i + 1).min(NP_BUTTONS - 1)),
+        (HomeSel::NowPlaying(i), "left") => HomeSel::NowPlaying(i.saturating_sub(1)),
+        (HomeSel::NowPlaying(_), "down") if recents > 0 => HomeSel::Recents(0),
+        (HomeSel::NowPlaying(_), "down") => HomeSel::Shortcuts(0),
+
+        (HomeSel::Recents(i), "right") => HomeSel::Recents((i + 1).min(recents.saturating_sub(1))),
+        (HomeSel::Recents(i), "left") => HomeSel::Recents(i.saturating_sub(1)),
+        (HomeSel::Recents(_), "down") => HomeSel::Shortcuts(0),
+        // Land on play/pause rather than an edge button.
+        (HomeSel::Recents(_), "up") if np => HomeSel::NowPlaying(NP_PLAY),
+
+        // Recents keep priority on the way up; the card is only reached
+        // directly from Shortcuts when there are no recents in between.
+        (HomeSel::Shortcuts(_), "up") if recents > 0 => HomeSel::Recents(0),
+        (HomeSel::Shortcuts(_), "up") if np => HomeSel::NowPlaying(NP_PLAY),
+        (HomeSel::Shortcuts(i), "right") => {
+            HomeSel::Shortcuts((i + 1).min(shortcuts.saturating_sub(1)))
+        }
+        (HomeSel::Shortcuts(i), "left") => HomeSel::Shortcuts(i.saturating_sub(1)),
+        (other, _) => other,
+    }
 }
 
 /// The root router view.
@@ -212,6 +300,24 @@ pub struct SpotlightView {
     recents_scroll: gpui::ScrollHandle,
     shortcuts_scroll: gpui::ScrollHandle,
     results_scroll: gpui::ScrollHandle,
+    /// Latest snapshot pulled from `ui.now_playing`, refreshed once at the top
+    /// of `render`. Cached rather than re-read on demand because
+    /// `screen_height` runs twice per frame and has to stay a pure, synchronous
+    /// sum of constants.
+    np: Option<NowPlayingSnapshot>,
+    /// Decoded artwork for `np.artwork`. A single slot rather than an entry in
+    /// `icon_cache`, which is never evicted — album art would accumulate there
+    /// for the life of the process.
+    np_art: Option<(PathBuf, Arc<RenderImage>)>,
+    /// Bounds recorder for the transport row so the selection pill can track
+    /// its three buttons. There is no overflow scrolling here; `track_scroll`
+    /// records child bounds regardless.
+    np_scroll: gpui::ScrollHandle,
+    /// True while the panel is on screen. Gates the now-playing poke timer, so
+    /// a launcher that is never summoned runs no AppleScript at all.
+    revealed: bool,
+    /// Whether the now-playing poll loop has been started (once per view).
+    np_watching: bool,
     /// `observe_window_activation` fires once on registration; we skip that first
     /// call so we don't hide the panel during construction.
     activation_primed: bool,
@@ -311,6 +417,13 @@ impl SpotlightView {
             recents_scroll: gpui::ScrollHandle::new(),
             shortcuts_scroll: gpui::ScrollHandle::new(),
             results_scroll: gpui::ScrollHandle::new(),
+            np: None,
+            np_art: None,
+            np_scroll: gpui::ScrollHandle::new(),
+            // Headless capture shows the window at launch without going
+            // through `reveal`, so seed the flag the same way `run` does.
+            revealed: std::env::var_os("SPOTLIGHT_CAPTURE").is_some(),
+            np_watching: false,
             activation_primed: false,
             reveal_start: Instant::now(),
             exiting: false,
@@ -387,6 +500,19 @@ impl SpotlightView {
                         view.settings_active = i;
                     }
                 }
+            }
+        }
+        // Place the Home selection for captures, so the highlight pill can be
+        // photographed on a specific control. `np:<i>` / `recents:<i>` /
+        // `shortcuts:<i>`.
+        if let Ok(sel) = std::env::var("SPOTLIGHT_CAPTURE_HOME_SEL") {
+            let (kind, i) = sel.split_once(':').unwrap_or((sel.as_str(), "0"));
+            let i = i.parse::<usize>().unwrap_or(0);
+            match kind {
+                "np" => view.home_sel = HomeSel::NowPlaying(i.min(NP_BUTTONS - 1)),
+                "recents" => view.home_sel = HomeSel::Recents(i),
+                "shortcuts" => view.home_sel = HomeSel::Shortcuts(i),
+                _ => {}
             }
         }
 
@@ -499,6 +625,9 @@ impl SpotlightView {
                 let shortcuts = (self.ui.panels.len() + 1) as f32;
                 let mut body =
                     HOME_BODY_PAD + SECTION_LABEL_H + (shortcuts * SHORTCUT_ROW_H).min(SHORTCUTS_MAX_H);
+                if self.np.is_some() {
+                    body += SECTION_LABEL_H + NOW_PLAYING_H;
+                }
                 if !self.config.recents().is_empty() {
                     body += SECTION_LABEL_H + RECENTS_STRIP_H;
                 }
@@ -677,28 +806,54 @@ impl SpotlightView {
         self.ui.panels.len() + 1
     }
 
+    /// Whether the now-playing card is on screen and therefore navigable.
+    fn np_visible(&self) -> bool {
+        self.np.is_some()
+    }
+
+    /// Drop a selection that pointed at the now-playing card after it went away
+    /// (the track ended, or Music quit) so Enter can't act on a hidden control.
+    fn clamp_home_sel(&mut self) {
+        if matches!(self.home_sel, HomeSel::NowPlaying(_)) && !self.np_visible() {
+            self.reset_home_sel();
+        }
+    }
+
     fn home_nav(&mut self, key: &str) {
-        let recents = self.recents_count();
-        let shortcuts = self.shortcuts_count();
-        self.home_sel = match (self.home_sel, key) {
-            (HomeSel::Recents(i), "right") => {
-                HomeSel::Recents((i + 1).min(recents.saturating_sub(1)))
-            }
-            (HomeSel::Recents(i), "left") => HomeSel::Recents(i.saturating_sub(1)),
-            (HomeSel::Recents(_), "down") => HomeSel::Shortcuts(0),
-            (HomeSel::Shortcuts(_), "up") if recents > 0 => HomeSel::Recents(0),
-            (HomeSel::Shortcuts(i), "right") => {
-                HomeSel::Shortcuts((i + 1).min(shortcuts.saturating_sub(1)))
-            }
-            (HomeSel::Shortcuts(i), "left") => HomeSel::Shortcuts(i.saturating_sub(1)),
-            (other, _) => other,
-        };
+        self.home_sel = next_home_sel(
+            self.home_sel,
+            key,
+            self.recents_count(),
+            self.shortcuts_count(),
+            self.np_visible(),
+        );
         // Scrolling the selection into view is handled by the animated scroll in
         // `tick_highlight`, at the same speed as the highlight pill.
     }
 
     fn home_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.home_sel {
+            HomeSel::NowPlaying(i) => {
+                let Some(src) = &self.ui.now_playing else {
+                    return;
+                };
+                let cmd = match i {
+                    0 => Transport::Prev,
+                    2 => Transport::Next,
+                    _ => Transport::PlayPause,
+                };
+                (src.control)(cmd);
+                // Flip the glyph immediately rather than waiting for the next
+                // poll to come back; that poll then reconciles it.
+                if cmd == Transport::PlayPause {
+                    if let Some(np) = &mut self.np {
+                        np.playing = !np.playing;
+                    }
+                }
+                // Deliberately does not hide the launcher: transport controls
+                // are something you use repeatedly.
+                cx.notify();
+            }
             HomeSel::Recents(i) => {
                 if let Some(recent) = self.config.recents().get(i).cloned() {
                     self.reopen_and_record(recent, window, cx);
@@ -844,6 +999,12 @@ impl SpotlightView {
         self.cur_w = None;
         self.slide = None;
         spotlight_platform_macos::window::show_panel(ns_view);
+        self.revealed = true;
+        // Ask for fresh playback state now rather than waiting for the first
+        // timer tick, so the card is right on the frame Home appears.
+        if let Some(src) = &self.ui.now_playing {
+            (src.poke)();
+        }
         // Restart the springy open-reveal from the next frame.
         self.reveal_start = Instant::now();
         // Reload config so settings changed last session take effect, and start
@@ -862,6 +1023,7 @@ impl SpotlightView {
         let Some(ns_view) = appkit_view_ptr(window) else {
             return;
         };
+        self.revealed = false;
         if std::env::var_os("SPOTLIGHT_CAPTURE").is_some() {
             spotlight_platform_macos::window::hide_panel(ns_view);
             return;
@@ -1155,8 +1317,202 @@ impl SpotlightView {
         panel.into_any_element()
     }
 
+    /// Start the loop that keeps the card live while Home is on screen. Pokes
+    /// the source (which polls Music.app at an interactive rate for a few
+    /// seconds afterwards) only while the panel is actually visible and showing
+    /// Home, so a closed launcher costs nothing. Mirrors the clipboard panel's
+    /// store-watch loop.
+    fn watch_now_playing(&mut self, cx: &mut Context<Self>) {
+        if self.np_watching || self.ui.now_playing.is_none() {
+            return;
+        }
+        self.np_watching = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(NP_POKE_MS))
+                .await;
+            let keep = this
+                .update(cx, |this, cx| {
+                    if !this.revealed || this.screen != Screen::Home {
+                        return;
+                    }
+                    if let Some(src) = &this.ui.now_playing {
+                        (src.poke)();
+                    }
+                    // The snapshot itself is picked up by `sync_now_playing`
+                    // on the frame this notify schedules.
+                    cx.notify();
+                })
+                .is_ok();
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Pull the latest now-playing snapshot and keep the decoded artwork in
+    /// step with it. Called once at the top of `render`, before `screen_height`
+    /// reads `np`.
+    fn sync_now_playing(&mut self, window: &mut Window) {
+        let Some(src) = &self.ui.now_playing else {
+            return;
+        };
+        self.np = (src.snapshot)();
+        self.clamp_home_sel();
+
+        let wanted = self.np.as_ref().and_then(|np| np.artwork.clone());
+        if self.np_art.as_ref().map(|(path, _)| path) == wanted.as_ref() {
+            return;
+        }
+        // Release the old texture rather than letting the atlas grow one entry
+        // per track for the life of the process.
+        if let Some((_, old)) = self.np_art.take() {
+            let _ = window.drop_image(old);
+        }
+        // Already downscaled to a thumbnail by the source, so decoding it on
+        // the UI thread costs well under a frame.
+        self.np_art = wanted.and_then(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            Some((path, decode_image_bytes(&bytes)?))
+        });
+    }
+
+    /// The now-playing card: artwork, title/artist, an interpolated progress bar
+    /// and the transport row. Only built when a snapshot is present, so Home
+    /// shrinks back to its usual height whenever music stops.
+    fn render_now_playing(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let np = self.np.clone()?;
+        let art = np_art_tile(self.np_art.as_ref().map(|(_, image)| image.clone()));
+
+        let pos = position_at(
+            np.position_secs,
+            np.duration_secs,
+            np.playing,
+            np.sampled_at.elapsed().as_secs_f64(),
+        );
+        let bar = div()
+            .h(px(3.))
+            .w_full()
+            .rounded_full()
+            .overflow_hidden()
+            .bg(theme::divider())
+            .child(
+                div()
+                    .h_full()
+                    .w(gpui::relative(progress_fraction(pos, np.duration_secs)))
+                    .rounded_full()
+                    .bg(theme::accent()),
+            );
+
+        let mut buttons = div()
+            .id("home-np-transport")
+            // No overflow scrolling here; the handle is only a bounds recorder
+            // so the shared highlight pill can track the three buttons.
+            .track_scroll(&self.np_scroll)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1();
+        for i in 0..NP_BUTTONS {
+            buttons = buttons.child(
+                div()
+                    .id(("home-np-button", i))
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(HL_RADIUS))
+                    .text_color(theme::accent())
+                    .hover(|s| s.bg(theme::hover_strong()))
+                    .child(np_glyph(i, np.playing).to_string())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.home_sel = HomeSel::NowPlaying(i);
+                            this.home_activate(window, cx);
+                        }),
+                    ),
+            );
+        }
+        // The pill is positioned against the tracked row's own origin, so the
+        // `relative` wrapper has to sit directly around it (see `item_rect`).
+        let pill = self.highlight_pill(HlContext::NowPlaying, &self.np_scroll, 4.);
+        let transport = div()
+            .relative()
+            .when_some(pill, |a, p| a.child(p))
+            .child(buttons);
+
+        let text = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            // Without a zero min-width a flex child refuses to shrink below its
+            // content, and a long title would push the transport row off-card.
+            .min_w(px(0.))
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme::text())
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(np.title.clone()),
+            )
+            .child(
+                // Time sits inline at the end of the artist row rather than on
+                // its own line, so the card stays as tall as its artwork.
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(artist_album(&np.artist, &np.album)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(format!("{} / {}", mmss(pos), mmss(np.duration_secs))),
+                    ),
+            )
+            .child(bar);
+
+        Some(
+            div()
+                .mx_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py(px(10.))
+                .rounded_xl()
+                .bg(theme::hover())
+                .border_1()
+                .border_color(theme::divider())
+                .child(art)
+                .child(text)
+                .child(transport)
+                .into_any_element(),
+        )
+    }
+
     fn render_home_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut col = div().flex().flex_col().px_2().pb_2().gap_1();
+
+        // Now playing — a status banner directly under the search row, present
+        // only while Music.app has a track loaded.
+        if let Some(card) = self.render_now_playing(cx) {
+            col = col.child(section_label("Now playing")).child(card);
+        }
 
         // Recently opened — a horizontal, scrollable strip of compact cards, so
         // it uses width rather than stacking vertically. Derived (de-duplicated)
@@ -1426,6 +1782,9 @@ impl SpotlightView {
                 Some((HlContext::Results, self.results_scroll.clone(), self.selected))
             }
             Screen::Home => match self.home_sel {
+                HomeSel::NowPlaying(i) if self.np.is_some() => {
+                    Some((HlContext::NowPlaying, self.np_scroll.clone(), i))
+                }
                 HomeSel::Shortcuts(i) => {
                     Some((HlContext::Shortcuts, self.shortcuts_scroll.clone(), i))
                 }
@@ -1481,7 +1840,8 @@ impl SpotlightView {
         self.hl_ready = true;
 
         // --- scroll the selection into view at the pill's speed ---
-        let horizontal = matches!(ctx, HlContext::Recents | HlContext::Shortcuts);
+        let horizontal =
+            matches!(ctx, HlContext::Recents | HlContext::Shortcuts | HlContext::NowPlaying);
         let (pos, size, viewport, max_off, cur_off) = if horizontal {
             (
                 tx,
@@ -1610,6 +1970,9 @@ impl Render for SpotlightView {
 
         // Per-screen top offset: search-shaped screens sit low (140); the large
         // Settings panel sits higher (60) so it reads as centered.
+        self.sync_now_playing(window);
+        self.watch_now_playing(cx);
+
         let top = self.panel_top(&self.screen);
         let body = self.render_body(window, cx);
 
@@ -1700,6 +2063,13 @@ const SECTION_LABEL_H: f32 = 32.0;
 const SHORTCUT_ROW_H: f32 = 48.0;
 const SHORTCUTS_MAX_H: f32 = 190.0;
 const RECENTS_STRIP_H: f32 = 96.0;
+/// The now-playing card: 52px of artwork plus 8px of padding above and below.
+/// Home's height is computed rather than measured, so this has to match what
+/// the card actually renders as — too small and `chrome` clips it, too large
+/// and a dead gap opens above "Recently opened". Verify with scripts/capture.sh.
+const NOW_PLAYING_H: f32 = 80.0;
+/// How often Home nudges the now-playing source while it is on screen.
+const NP_POKE_MS: u64 = 500;
 const HOME_BODY_PAD: f32 = 20.0;
 const RESULT_ROW_H: f32 = 65.0;
 const RESULTS_PAD: f32 = 28.0;
@@ -1741,6 +2111,7 @@ enum HlContext {
     Results,
     Shortcuts,
     Recents,
+    NowPlaying,
 }
 
 /// Semi-implicit Euler step of a 1-D spring toward `target`.
@@ -1951,6 +2322,100 @@ fn shell_content(
         .child(div().h(px(1.)).bg(theme::divider()))
         .child(div().flex_1().overflow_hidden().child(content))
         .into_any_element()
+}
+
+// ---- Now-playing card ------------------------------------------------------
+
+/// Buttons in the transport row (previous, play/pause, next).
+const NP_BUTTONS: usize = 3;
+/// Index of the play/pause button — where a vertical move into the card lands.
+const NP_PLAY: usize = 1;
+/// Artwork edge length (px) in the now-playing card. Larger than the Home tiles'
+/// `ICON_SIZE`, since album art is the card's focal point — and tall enough to
+/// govern the card's height, so the text column has slack rather than the
+/// progress bar crowding the bottom border.
+const NP_ART: f32 = 56.0;
+/// Corner rounding of the artwork, proportional to `ICON_RADIUS` at `ICON_SIZE`.
+const NP_ART_RADIUS: f32 = 12.0;
+
+/// Playback position at render time: the last sampled position plus the wall
+/// time since that sample while playing, so the progress bar advances smoothly
+/// between the source's polls instead of stepping once a second.
+fn position_at(sampled: f64, dur: f64, playing: bool, since: f64) -> f64 {
+    let pos = if playing { sampled + since } else { sampled };
+    pos.clamp(0.0, dur.max(0.0))
+}
+
+/// Progress as 0..=1. A missing or nonsensical duration (streams report 0)
+/// yields an empty bar rather than a full or negative one.
+fn progress_fraction(pos: f64, dur: f64) -> f32 {
+    if dur <= 0.0 {
+        return 0.0;
+    }
+    (pos / dur).clamp(0.0, 1.0) as f32
+}
+
+/// Seconds as `m:ss` (or `h:mm:ss` past an hour).
+fn mmss(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// The card's secondary line: artist, or `artist · album` when both are known.
+fn artist_album(artist: &str, album: &str) -> String {
+    match (artist.trim(), album.trim()) {
+        ("", "") => String::new(),
+        (a, "") => a.to_string(),
+        ("", b) => b.to_string(),
+        (a, b) => format!("{a} \u{b7} {b}"),
+    }
+}
+
+/// The artwork tile, at the card's larger size. Falls back to a note glyph —
+/// radio and streams often carry no art, and it is also what shows for the
+/// moment before the first artwork dump lands.
+fn np_art_tile(image: Option<Arc<RenderImage>>) -> AnyElement {
+    let inner = match image {
+        Some(image) => img(ImageSource::Render(image))
+            .w(px(NP_ART))
+            .h(px(NP_ART))
+            .rounded(px(NP_ART_RADIUS))
+            .object_fit(ObjectFit::Cover)
+            .into_any_element(),
+        None => div()
+            .text_xl()
+            .text_color(theme::accent())
+            .child("\u{266a}".to_string())
+            .into_any_element(),
+    };
+    div()
+        .flex_shrink_0()
+        .size(px(NP_ART))
+        .rounded(px(NP_ART_RADIUS))
+        .overflow_hidden()
+        .bg(theme::icon_bg())
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(inner)
+        .into_any_element()
+}
+
+/// Transport glyph for a button index, given whether playback is running.
+/// Geometric shapes rather than emoji, so they inherit the accent color and the
+/// panel's font instead of rendering as color glyphs.
+fn np_glyph(i: usize, playing: bool) -> &'static str {
+    match i {
+        0 => "\u{23ee}",                                          // previous
+        2 => "\u{23ed}",                                          // next
+        _ if playing => "\u{23f8}",                               // pause
+        _ => "\u{25b6}",                                          // play
+    }
 }
 
 fn section_label(text: &str) -> impl IntoElement {
@@ -2308,7 +2773,8 @@ fn appkit_view_ptr(window: &Window) -> Option<*mut std::ffi::c_void> {
 /// agent verify renders without an external screenshot tool. Env knobs:
 /// `SPOTLIGHT_CAPTURE` (output path), `SPOTLIGHT_CAPTURE_DELAY_MS` (default 1000),
 /// `SPOTLIGHT_CAPTURE_QUERY` (pre-filled search text),
-/// `SPOTLIGHT_CAPTURE_SCREEN` (`settings` or a panel id to deep-link).
+/// `SPOTLIGHT_CAPTURE_SCREEN` (`settings` or a panel id to deep-link),
+/// `SPOTLIGHT_CAPTURE_HOME_SEL` (`np:1`, `recents:0`, `shortcuts:2`).
 fn spawn_capture_thread() {
     let Ok(path) = std::env::var("SPOTLIGHT_CAPTURE") else {
         return;
@@ -2558,4 +3024,95 @@ fn register_global_hotkey(cx: &mut App, window_handle: WindowHandle<SpotlightVie
     };
     // Keep the registration alive for the lifetime of the process.
     Box::leak(Box::new(hotkey));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mmss_formats_common_durations() {
+        assert_eq!(mmss(0.0), "0:00");
+        assert_eq!(mmss(9.0), "0:09");
+        assert_eq!(mmss(61.4), "1:01");
+        assert_eq!(mmss(3599.0), "59:59");
+        assert_eq!(mmss(3600.0), "1:00:00");
+        // A stream reporting a nonsense duration shouldn't render garbage.
+        assert_eq!(mmss(-5.0), "0:00");
+        assert_eq!(mmss(f64::NAN), "0:00");
+    }
+
+    #[test]
+    fn progress_fraction_handles_missing_durations() {
+        assert_eq!(progress_fraction(30.0, 120.0), 0.25);
+        // Streams report a zero duration; an empty bar beats a full one.
+        assert_eq!(progress_fraction(30.0, 0.0), 0.0);
+        assert_eq!(progress_fraction(30.0, -1.0), 0.0);
+        // Interpolation can overshoot just past the end of a track.
+        assert_eq!(progress_fraction(130.0, 120.0), 1.0);
+    }
+
+    #[test]
+    fn position_advances_only_while_playing() {
+        assert_eq!(position_at(10.0, 100.0, true, 2.5), 12.5);
+        assert_eq!(position_at(10.0, 100.0, false, 2.5), 10.0);
+        // Never runs past the end while waiting for the next poll.
+        assert_eq!(position_at(99.0, 100.0, true, 30.0), 100.0);
+    }
+
+    #[test]
+    fn artist_album_joins_what_is_known() {
+        assert_eq!(artist_album("A", "B"), "A \u{b7} B");
+        assert_eq!(artist_album("A", ""), "A");
+        assert_eq!(artist_album("", "B"), "B");
+        assert_eq!(artist_album("", ""), "");
+    }
+
+    fn nav(sel: HomeSel, key: &str, recents: usize, np: bool) -> HomeSel {
+        next_home_sel(sel, key, recents, 6, np)
+    }
+
+    #[test]
+    fn up_from_recents_reaches_the_card() {
+        assert!(matches!(
+            nav(HomeSel::Recents(2), "up", 5, true),
+            HomeSel::NowPlaying(NP_PLAY)
+        ));
+        // Nothing above Recents when the card is hidden.
+        assert!(matches!(nav(HomeSel::Recents(2), "up", 5, false), HomeSel::Recents(2)));
+    }
+
+    #[test]
+    fn up_from_shortcuts_prefers_recents_over_the_card() {
+        assert!(matches!(nav(HomeSel::Shortcuts(1), "up", 5, true), HomeSel::Recents(0)));
+        // With no recents in between, Shortcuts reaches the card directly.
+        assert!(matches!(
+            nav(HomeSel::Shortcuts(1), "up", 0, true),
+            HomeSel::NowPlaying(NP_PLAY)
+        ));
+        assert!(matches!(nav(HomeSel::Shortcuts(1), "up", 0, false), HomeSel::Shortcuts(1)));
+    }
+
+    #[test]
+    fn transport_row_clamps_at_both_ends() {
+        assert!(matches!(nav(HomeSel::NowPlaying(0), "left", 5, true), HomeSel::NowPlaying(0)));
+        assert!(matches!(nav(HomeSel::NowPlaying(1), "left", 5, true), HomeSel::NowPlaying(0)));
+        assert!(matches!(nav(HomeSel::NowPlaying(1), "right", 5, true), HomeSel::NowPlaying(2)));
+        assert!(matches!(nav(HomeSel::NowPlaying(2), "right", 5, true), HomeSel::NowPlaying(2)));
+    }
+
+    #[test]
+    fn down_from_the_card_skips_absent_recents() {
+        assert!(matches!(nav(HomeSel::NowPlaying(1), "down", 5, true), HomeSel::Recents(0)));
+        assert!(matches!(nav(HomeSel::NowPlaying(1), "down", 0, true), HomeSel::Shortcuts(0)));
+    }
+
+    #[test]
+    fn existing_recents_and_shortcuts_navigation_is_unchanged() {
+        assert!(matches!(nav(HomeSel::Recents(0), "right", 5, true), HomeSel::Recents(1)));
+        assert!(matches!(nav(HomeSel::Recents(4), "right", 5, true), HomeSel::Recents(4)));
+        assert!(matches!(nav(HomeSel::Recents(1), "down", 5, true), HomeSel::Shortcuts(0)));
+        assert!(matches!(nav(HomeSel::Shortcuts(0), "left", 5, true), HomeSel::Shortcuts(0)));
+        assert!(matches!(nav(HomeSel::Shortcuts(5), "right", 5, true), HomeSel::Shortcuts(5)));
+    }
 }

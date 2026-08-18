@@ -7,14 +7,19 @@
 //! listening. Reading Music.app directly sees every source: stations, library,
 //! playlists, radio.
 //!
+//! Reading Music.app itself lives in [`crate::nowplaying`], which this worker
+//! shares with the Home now-playing card.
+//!
 //! Requires the Automation (Apple Events → Music) TCC grant, same as the
 //! cleanup worker.
 
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use crate::nowplaying::{poll, NowPlaying, NowPlayingStore};
 
 /// How often Music.app is polled. Short enough to time plays accurately,
 /// long enough to be free in CPU terms.
@@ -23,23 +28,6 @@ const POLL: Duration = Duration::from_secs(10);
 const SCROBBLE_AFTER_SECS: f64 = 240.0;
 /// Tracks shorter than this are never scrobbled (Last.fm ignores them anyway).
 const MIN_TRACK_SECS: f64 = 30.0;
-
-/// One observation of Music.app's state.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NowPlaying {
-    pub playing: bool,
-    pub artist: String,
-    pub title: String,
-    pub album: String,
-    pub duration_secs: f64,
-    pub position_secs: f64,
-}
-
-impl NowPlaying {
-    fn identity(&self) -> String {
-        format!("{}|{}", self.artist, self.title)
-    }
-}
 
 /// A play that met the threshold and is waiting to reach the server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -138,21 +126,31 @@ fn save_queue(queue: &[PendingPlay]) {
 
 /// Spawn the Music.app scrobble worker (started from `app`'s main alongside
 /// the cleanup worker).
-pub fn spawn_scrobble_worker() {
+pub fn spawn_scrobble_worker(store: Arc<NowPlayingStore>) {
     std::thread::Builder::new()
         .name("music-scrobbler".into())
-        .spawn(|| {
+        .spawn(move || {
             let mut state = ScrobbleState::default();
             // Plays survive server downtime, sleep, and app restarts.
             let mut queue = load_queue();
+            let mut last_tick = Instant::now();
             loop {
                 std::thread::sleep(POLL);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                if let Some(np) = now_playing() {
-                    if let Some(play) = state.observe(&np, now, POLL.as_secs_f64()) {
+                // Wall time actually elapsed, not the nominal interval: sleep
+                // and a slow Apple event both stretch a tick, and `observe`
+                // clamps the credited listening time against this.
+                let elapsed = last_tick.elapsed().as_secs_f64();
+                last_tick = Instant::now();
+                let np = poll();
+                // Share every observation so the Home card has recent state the
+                // moment the launcher opens, without polling on its own.
+                store.publish(np.clone());
+                if let Some(np) = np {
+                    if let Some(play) = state.observe(&np, now, elapsed) {
                         eprintln!("music-scrobbler: {} — {}", play.artist, play.title);
                         queue.push(play);
                         save_queue(&queue);
@@ -191,73 +189,22 @@ fn flush(queue: &[PendingPlay]) -> bool {
     }
 }
 
-/// Read Music.app's current state, or `None` when it isn't running or has
-/// nothing loaded. Never launches Music.
-fn now_playing() -> Option<NowPlaying> {
-    let running = Command::new("/usr/bin/pgrep")
-        .args(["-x", "Music"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !running {
-        return None;
-    }
-    // Tab-separated so titles containing commas/quotes stay intact. The
-    // `with timeout` matters: without it a busy or permission-blocked Music
-    // stalls the Apple event for ~2 minutes per tick; the outer try turns that
-    // (and any transient error) into a skipped tick.
-    const SCRIPT: &str = r#"
-try
-  with timeout of 5 seconds
-    tell application "Music"
-      set s to (player state as text)
-      set t to current track
-      return s & tab & (get artist of t) & tab & (get name of t) & tab & (get album of t) & tab & (get duration of t) & tab & (get player position)
-    end tell
-  end timeout
-on error
-  return "none"
-end try"#;
-    let out = Command::new("/usr/bin/osascript").arg("-e").arg(SCRIPT).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_now_playing(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Parse the tab-separated osascript output. Defensive: any malformed or
-/// partial line yields `None` rather than a half-populated play.
-pub fn parse_now_playing(raw: &str) -> Option<NowPlaying> {
-    let line = raw.trim();
-    if line.is_empty() || line == "none" {
-        return None;
-    }
-    let f: Vec<&str> = line.split('\t').collect();
-    if f.len() < 6 {
-        return None;
-    }
-    Some(NowPlaying {
-        playing: f[0] == "playing",
-        artist: f[1].trim().to_string(),
-        title: f[2].trim().to_string(),
-        album: f[3].trim().to_string(),
-        duration_secs: f[4].trim().parse().ok()?,
-        position_secs: f[5].trim().parse().unwrap_or(0.0),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::nowplaying::PlayerState;
+
     fn np(title: &str, pos: f64, dur: f64, playing: bool) -> NowPlaying {
         NowPlaying {
             playing,
+            state: if playing { PlayerState::Playing } else { PlayerState::Paused },
             artist: "Artist".into(),
             title: title.into(),
             album: "Album".into(),
             duration_secs: dur,
             position_secs: pos,
+            persistent_id: "TEST".into(),
         }
     }
 
@@ -329,11 +276,13 @@ mod tests {
         let mut s = ScrobbleState::default();
         let blank = NowPlaying {
             playing: true,
+            state: PlayerState::Playing,
             artist: "".into(),
             title: "".into(),
             album: "".into(),
             duration_secs: 200.0,
             position_secs: 100.0,
+            persistent_id: String::new(),
         };
         assert!(s.observe(&blank, 1000, 10.0).is_none());
     }
@@ -362,25 +311,4 @@ mod tests {
         assert_eq!(got.expect("scrobbled").played_at, 4960);
     }
 
-    #[test]
-    fn parses_osascript_output() {
-        let np = parse_now_playing("playing\tBoards of Canada\tRoygbiv\tMHTRTC\t151.52\t42.5").unwrap();
-        assert_eq!(np.artist, "Boards of Canada");
-        assert_eq!(np.title, "Roygbiv");
-        assert!(np.playing);
-        assert_eq!(np.duration_secs, 151.52);
-        assert_eq!(np.position_secs, 42.5);
-
-        assert!(parse_now_playing("none").is_none());
-        assert!(parse_now_playing("").is_none());
-        assert!(parse_now_playing("playing\tonly\ttwo").is_none());
-    }
-
-    #[test]
-    fn title_with_comma_survives() {
-        let np = parse_now_playing("paused\tCrosby, Stills & Nash\tSuite: Judy Blue Eyes\tCSN\t425.0\t0").unwrap();
-        assert_eq!(np.artist, "Crosby, Stills & Nash");
-        assert_eq!(np.title, "Suite: Judy Blue Eyes");
-        assert!(!np.playing);
-    }
 }

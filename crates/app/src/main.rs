@@ -27,13 +27,11 @@ fn main() {
     // its background monitor here; its search/panel/settings all read from it.
     let clipboard = ext_clipboard::Clipboard::new();
 
-    // Hourly Music.app playlist-cleanup sweep for the ampm server (the official
-    // Apple Music API cannot delete playlists; this Mac is the only actor that
-    // can). No-ops until Settings → Music is configured.
-    ext_music::spawn_cleanup_worker();
-    // Apple's cloud listening history doesn't record station playback, so the
-    // Mac reports what Music.app actually plays to the ampm server.
-    ext_music::spawn_scrobble_worker();
+    // The music extension owns the shared now-playing state read from Music.app
+    // and starts its two background workers (hourly playlist cleanup, and
+    // scrobbling what actually plays); the Home now-playing card reads the same
+    // state.
+    let music = ext_music::Music::new();
 
     let mut registry = Registry::new();
     registry.register(Arc::new(AppsExtension::new()));
@@ -70,6 +68,8 @@ fn main() {
         menu_items: clipboard.menu_items(),
         // Inline AI autocomplete (ghost text) + "Ask AI" suggestion rows.
         autocomplete: Some(ext_llm::autocomplete_provider()),
+        // Now-playing card on Home, shown only while Music.app has a track.
+        now_playing: Some(music.now_playing_source()),
     };
 
     spotlight_ui::run(registry, ui);

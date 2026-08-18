@@ -14,3 +14,6 @@ ureq.workspace = true
 spotlight-core.workspace = true
 spotlight-config.workspace = true
 spotlight-ui.workspace = true
+# Artwork is downscaled here rather than in the shell, so the UI thread only
+# ever decodes a thumbnail.
+image.workspace = true
