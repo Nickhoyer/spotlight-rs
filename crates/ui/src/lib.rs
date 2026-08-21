@@ -33,7 +33,7 @@ use gpui::{
 };
 
 use spotlight_config::{AppConfig, Recent};
-use spotlight_core::{Action, Icon, Registry, ResultItem};
+use spotlight_core::{Action, Extension, Icon, Query, Registry, ResultItem};
 
 use crate::settings::GeneralSettingsView;
 
@@ -45,6 +45,10 @@ const MIN_AC_LEN: usize = 2;
 /// Debounce before firing an autocomplete request, so mid-word keystrokes don't
 /// each spawn a call.
 const AC_DEBOUNCE_MS: u64 = 250;
+/// Debounce before a keyword-routed extension search fires. Shorter than the
+/// autocomplete debounce — these results *are* the list, so they should feel
+/// like typeahead — but long enough that a burst of keystrokes is one request.
+const KW_DEBOUNCE_MS: u64 = 120;
 
 /// How long Escape must be held before it collapses the whole navigation stack
 /// straight back to Home, instead of tapping it once per level.
@@ -267,6 +271,10 @@ pub struct SpotlightView {
     screen: Screen,
     query: String,
     results: Vec<ResultItem>,
+    /// `results` before AI suggestions are spliced in. Kept so a late
+    /// suggestion can be re-spliced without re-running the query — which, for a
+    /// keyword-routed extension, would mean another network round trip.
+    ranked: Vec<ResultItem>,
     selected: usize,
     /// Greyed-out inline autocomplete: the continuation shown after the caret and
     /// accepted with Tab. Seeded instantly from a strong local match, then
@@ -277,12 +285,16 @@ pub struct SpotlightView {
     /// The query `ghost`/`ai_suggestions` were computed for; guards against
     /// splicing stale suggestions after the query has moved on.
     ai_query: String,
-    /// Bumped on every query change so a late autocomplete response for an older
-    /// query can be dropped.
-    ac_gen: u64,
+    /// Bumped on every query change so a late response — autocomplete or a
+    /// keyword-routed search — for an older query can be dropped.
+    query_gen: u64,
     /// The in-flight debounced autocomplete task (dropped/cancelled on the next
     /// keystroke by being replaced).
     ac_task: Option<gpui::Task<()>>,
+    /// The in-flight keyword-routed search, held for the same reason: replacing
+    /// it drops the pending debounce timer, so a superseded query never fires
+    /// its request at all.
+    search_task: Option<gpui::Task<()>>,
     focus_handle: FocusHandle,
     /// Rasterized app icons keyed by path, so each icon is rasterized once and
     /// reused across frames (gpui's `RenderImage` is cached by `Arc` identity).
@@ -401,12 +413,14 @@ impl SpotlightView {
             screen: Screen::Home,
             query: String::new(),
             results: Vec::new(),
+            ranked: Vec::new(),
             selected: 0,
             ghost: String::new(),
             ai_suggestions: Vec::new(),
             ai_query: String::new(),
-            ac_gen: 0,
+            query_gen: 0,
             ac_task: None,
+            search_task: None,
             focus_handle,
             icon_cache: HashMap::new(),
             panel: None,
@@ -665,15 +679,21 @@ impl SpotlightView {
 
     // ---- query/search -----------------------------------------------------
 
-    /// Query all extensions, then apply the frecency usage boost and re-rank, so
-    /// frequently/recently used items float up among comparable matches.
-    fn ranked_results(&self, query: &str) -> Vec<ResultItem> {
-        let mut results = block_on(self.registry.query(query));
+    /// Apply the frecency usage boost and re-rank, so frequently/recently used
+    /// items float up among comparable matches.
+    fn boost_and_rank(&self, mut results: Vec<ResultItem>) -> Vec<ResultItem> {
         for item in &mut results {
             item.score = item.score.saturating_add(self.config.usage_boost(&item.id));
         }
         results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
         results
+    }
+
+    /// Query the always-on extensions. Each answers from memory or disk, so this
+    /// is allowed to block the UI thread; a keyword-routed extension may hit the
+    /// network and goes through [`Self::spawn_routed_search`] instead.
+    fn ranked_results(&self, query: &str) -> Vec<ResultItem> {
+        self.boost_and_rank(block_on(self.registry.query(query)))
     }
 
     /// Splice the AI "Ask AI" suggestion rows (when current for this query) into a
@@ -691,11 +711,68 @@ impl SpotlightView {
         ranked
     }
 
-    /// Recompute `results` from the registry and re-splice AI suggestions. Called
-    /// when an autocomplete response arrives (the query itself is unchanged).
+    /// Store a fresh ranking and rebuild the visible rows from it.
+    fn set_ranked(&mut self, ranked: Vec<ResultItem>) {
+        self.results = self.splice_suggestions(ranked.clone());
+        self.ranked = ranked;
+    }
+
+    /// Re-splice AI suggestions into the current ranking. Called when an
+    /// autocomplete response arrives (the query itself is unchanged), so the
+    /// stored ranking is reused rather than recomputed.
     fn rebuild_results(&mut self) {
-        let ranked = self.ranked_results(&self.query);
-        self.results = self.splice_suggestions(ranked);
+        self.results = self.splice_suggestions(self.ranked.clone());
+    }
+
+    /// Rows to show while a routed search is in flight: whatever is already on
+    /// screen if it came from the same extension — so typing refines a list
+    /// instead of flashing it away — otherwise a single placeholder.
+    fn pending_rows(&self, ext: &dyn Extension) -> Vec<ResultItem> {
+        if !self.ranked.is_empty() && self.ranked.iter().all(|r| r.source == ext.id()) {
+            return self.ranked.clone();
+        }
+        vec![ResultItem {
+            id: "search:pending".to_string(),
+            title: "Searching\u{2026}".to_string(),
+            subtitle: Some(ext.name().to_string()),
+            // The search bar's own magnifier, so the row reads as the field
+            // still working rather than as a result in its own right.
+            icon: Some(Icon::Glyph("\u{2315}".to_string())),
+            // Inert: Enter while the real rows are still in flight must not
+            // activate a stale one.
+            action: Action::None,
+            score: 0,
+            source: ext.id().to_string(),
+        }]
+    }
+
+    /// Run a keyword-routed extension's query off the UI thread, after a short
+    /// debounce, and apply the rows if the query hasn't moved on since.
+    fn spawn_routed_search(
+        &self,
+        ext: Arc<dyn Extension>,
+        q: Query,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        let gen = self.query_gen;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(Duration::from_millis(KW_DEBOUNCE_MS)).await;
+            // Superseded by a newer keystroke while we waited out the debounce,
+            // so the request never goes out at all.
+            if weak.update(cx, |t, _| t.query_gen != gen).unwrap_or(true) {
+                return;
+            }
+            let items = cx.background_executor().spawn(async move { ext.query(&q).await }).await;
+            let _ = weak.update(cx, |t, cx| {
+                if t.query_gen != gen {
+                    return;
+                }
+                let ranked = t.boost_and_rank(items);
+                t.set_ranked(ranked);
+                t.selected = t.selected.min(t.results.len().saturating_sub(1));
+                cx.notify();
+            });
+        })
     }
 
     fn refresh_query(&mut self, cx: &mut Context<Self>) {
@@ -703,16 +780,36 @@ impl SpotlightView {
         // A new query supersedes any pending autocomplete and its (now stale)
         // ghost. Keep prior suggestions only if they were computed for this exact
         // query (e.g. re-entering after Escape); otherwise drop them.
-        self.ac_gen = self.ac_gen.wrapping_add(1);
+        self.query_gen = self.query_gen.wrapping_add(1);
         self.ghost.clear();
         if self.ai_query != query {
             self.ai_suggestions.clear();
         }
 
+        // A keyword-routed extension is queried off the UI thread: it may go to
+        // the network, and blocking here would freeze the whole panel — down to
+        // the characters still being typed — for the length of the request.
+        let routed = self.registry.route(&query);
+        let ranked = match routed {
+            Some((ext, q)) => {
+                self.search_task = Some(self.spawn_routed_search(ext.clone(), q, cx));
+                self.pending_rows(ext.as_ref())
+            }
+            None => {
+                self.search_task = None;
+                self.ranked_results(&query)
+            }
+        };
+
         // Rank once, then reuse the ranking to seed an instant heuristic ghost and
-        // a candidate hint for the model.
-        let ranked = self.ranked_results(&query);
-        let hint = ranked.iter().find(|r| r.score > 0).map(|r| r.title.clone());
+        // a candidate hint for the model. A routed query has no ranking yet — and
+        // its rows are an extension's own phrasing, not something to complete the
+        // query with — so it gets neither.
+        let hint = if self.search_task.is_some() {
+            None
+        } else {
+            ranked.iter().find(|r| r.score > 0).map(|r| r.title.clone())
+        };
         if !query.is_empty() {
             if let Some(h) = &hint {
                 let (ql, hl) = (query.to_lowercase(), h.to_lowercase());
@@ -723,7 +820,7 @@ impl SpotlightView {
                 }
             }
         }
-        self.results = self.splice_suggestions(ranked);
+        self.set_ranked(ranked);
 
         self.selected = 0;
         self.screen = if self.query.trim().is_empty() {
@@ -751,19 +848,19 @@ impl SpotlightView {
         hint: Option<String>,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
-        let gen = self.ac_gen;
+        let gen = self.query_gen;
         let suggest = self.ui.autocomplete.as_ref().unwrap().suggest.clone();
         cx.spawn(async move |weak, cx| {
             cx.background_executor().timer(Duration::from_millis(AC_DEBOUNCE_MS)).await;
             // Superseded by a newer keystroke while we waited out the debounce.
-            if weak.update(cx, |t, _| t.ac_gen != gen).unwrap_or(true) {
+            if weak.update(cx, |t, _| t.query_gen != gen).unwrap_or(true) {
                 return;
             }
             let req = AutocompleteRequest { query: query.clone(), top_hint: hint };
             let out = cx.background_executor().spawn(async move { (suggest)(req) }).await;
             let Some(s) = out else { return };
             let _ = weak.update(cx, |t, cx| {
-                if t.ac_gen != gen || t.query != query {
+                if t.query_gen != gen || t.query != query {
                     return;
                 }
                 // The LLM completion replaces the instant heuristic; if it came

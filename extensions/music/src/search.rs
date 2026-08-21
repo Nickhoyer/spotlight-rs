@@ -1,7 +1,9 @@
 //! `radio <track>` in the main bar: live typeahead against the ampm server's
 //! catalog search. Unlike Jira (offline cache), this queries the network —
-//! acceptable because the keyword gates it to explicit use, the shell debounces
-//! input, and the client timeout is short.
+//! acceptable because the `radio` keyword gates it to explicit use (the
+//! registry never broadcasts a plain query to a keyworded extension), the shell
+//! debounces input and runs routed searches off the UI thread, and the client
+//! timeout is short.
 
 use async_trait::async_trait;
 
