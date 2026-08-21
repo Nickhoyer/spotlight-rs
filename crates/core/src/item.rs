@@ -29,10 +29,8 @@ pub enum Action {
     /// Copy text to the clipboard.
     Copy(String),
     /// Navigate to a full-screen extension panel by its id (e.g. open the
-    /// Clipboard History panel from a search result). `seed` overrides the text
-    /// the panel is opened with; `None` falls back to the current query (used by
-    /// AI suggestion entries to open the chat with a specific suggested question).
-    OpenPanel { id: String, seed: Option<String> },
+    /// Clipboard History panel from a search result).
+    OpenPanel { id: String },
     /// An extension-specific action, dispatched back to its owning extension's
     /// [`Extension::run`] with this id.
     Custom(String),

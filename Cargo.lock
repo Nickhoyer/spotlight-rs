@@ -2033,22 +2033,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ext-llm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "gpui",
- "serde",
- "serde_json",
- "spotlight-config",
- "spotlight-core",
- "spotlight-ui",
- "ureq",
-]
-
-[[package]]
 name = "ext-music"
 version = "0.1.0"
 dependencies = [
@@ -6075,7 +6059,6 @@ dependencies = [
  "ext-clipboard",
  "ext-gmail",
  "ext-jira",
- "ext-llm",
  "ext-music",
  "ext-scripts",
  "spotlight-core",

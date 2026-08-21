@@ -115,7 +115,7 @@ pub fn panel_entry() -> PanelEntry {
         title: "Music".to_string(),
         glyph: "🎵".to_string(),
         icon: None,
-        make_view: Box::new(|cx, _seed| cx.new(MusicView::new).into()),
+        make_view: Box::new(|cx| cx.new(MusicView::new).into()),
     }
 }
 

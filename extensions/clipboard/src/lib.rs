@@ -93,7 +93,7 @@ impl Clipboard {
             title: "Clipboard History".to_string(),
             glyph: GLYPH.to_string(),
             icon: None,
-            make_view: Box::new(move |cx, _seed| {
+            make_view: Box::new(move |cx| {
                 let store = store.clone();
                 cx.new(|cx| ClipboardView::new(store, cx)).into()
             }),

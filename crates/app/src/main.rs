@@ -44,9 +44,6 @@ fn main() {
     registry.register(Arc::new(ext_scripts::ScriptsExtension));
     // Clipboard history is searchable from the main bar (keyword: `clip`).
     registry.register(clipboard.extension());
-    // A dynamic "Ask AI" entry that always appears (ranked very low) and opens
-    // the chat panel seeded with the typed text.
-    registry.register(Arc::new(ext_llm::LlmSearch));
 
     // GPUI-aware extensions (panels + settings tabs + menu-bar items) are wired
     // here.
@@ -56,18 +53,14 @@ fn main() {
             ext_gmail::panel_entry(),
             ext_music::panel_entry(),
             clipboard.panel_entry(),
-            ext_llm::panel_entry(),
         ],
         settings_tabs: vec![
             ext_jira::settings_tab(),
             ext_gmail::settings_tab(),
             ext_music::settings_tab(),
             clipboard.settings_tab(),
-            ext_llm::settings_tab(),
         ],
         menu_items: clipboard.menu_items(),
-        // Inline AI autocomplete (ghost text) + "Ask AI" suggestion rows.
-        autocomplete: Some(ext_llm::autocomplete_provider()),
         // Now-playing card on Home, shown only while Music.app has a track.
         now_playing: Some(music.now_playing_source()),
     };

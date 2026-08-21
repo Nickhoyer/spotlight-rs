@@ -66,8 +66,8 @@ fn render_svg(svg: &str, size: u32) -> Option<tiny_skia::Pixmap> {
     Some(pixmap)
 }
 
-/// Return the cached rasterized logo for `kind` (`"clipboard"`, `"settings"`, or
-/// `"llm"` for AI Chat), or `None` for an unknown kind / rasterization failure.
+/// Return the cached rasterized logo for `kind` (`"clipboard"` or
+/// `"settings"`), or `None` for an unknown kind / rasterization failure.
 pub fn logo(kind: &str) -> Option<Arc<RenderImage>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<RenderImage>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -79,7 +79,6 @@ pub fn logo(kind: &str) -> Option<Arc<RenderImage>> {
     let svg = match kind {
         "clipboard" => clipboard_svg(),
         "settings" => settings_svg(),
-        "llm" => ai_svg(),
         _ => return None,
     };
     let image = rasterize(&svg, RASTER_PX).map(Arc::new);
@@ -170,14 +169,6 @@ fn clipboard_svg() -> String {
     let board = r##"<rect x="10" y="9" width="20" height="24" rx="3.4"/><rect x="15" y="5.6" width="10" height="6" rx="2.6"/>"##;
     logo_svg(&format!(
         r##"<g fill="#28c8f0" filter="url(#glow)" opacity="0.5">{board}</g><g fill="url(#sym)">{board}</g><g fill="#182231"><rect x="14" y="16.4" width="12" height="2.1" rx="1.05"/><rect x="14" y="20.6" width="12" height="2.1" rx="1.05"/><rect x="14" y="24.8" width="8" height="2.1" rx="1.05"/></g>"##
-    ))
-}
-
-/// Glowing cyan speech bubble with a bright white AI sparkle.
-fn ai_svg() -> String {
-    let bubble = r##"<path d="M12 9H28a5 5 0 0 1 5 5v9a5 5 0 0 1-5 5H19l-6 5v-5a5 5 0 0 1-5-5V14a5 5 0 0 1 5-5Z"/>"##;
-    logo_svg(&format!(
-        r##"<g fill="#28c8f0" filter="url(#glow)" opacity="0.6">{bubble}</g><g fill="url(#sym)">{bubble}</g><path d="M20.2 12.4c.8 3.9 2.1 5.2 6 6-3.9.8-5.2 2.1-6 6-.8-3.9-2.1-5.2-6-6 3.9-.8 5.2-2.1 6-6Z" fill="#f2feff"/><path d="M28.5 12c.4 1.9 1 2.5 2.9 2.9-1.9.4-2.5 1-2.9 2.9-.4-1.9-1-2.5-2.9-2.9 1.9-.4 2.5-1 2.9-2.9Z" fill="#eafcff" opacity="0.9"/>"##
     ))
 }
 

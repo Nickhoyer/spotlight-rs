@@ -40,14 +40,9 @@ use crate::settings::GeneralSettingsView;
 const MAX_RESULTS: usize = 50;
 /// How many recents to show on Home.
 const MAX_RECENTS: usize = 5;
-/// Don't ask the AI to autocomplete until the query is at least this long.
-const MIN_AC_LEN: usize = 2;
-/// Debounce before firing an autocomplete request, so mid-word keystrokes don't
-/// each spawn a call.
-const AC_DEBOUNCE_MS: u64 = 250;
-/// Debounce before a keyword-routed extension search fires. Shorter than the
-/// autocomplete debounce — these results *are* the list, so they should feel
-/// like typeahead — but long enough that a burst of keystrokes is one request.
+/// Debounce before a keyword-routed extension search fires. Short enough that
+/// these results — which *are* the list — feel like typeahead, but long enough
+/// that a burst of keystrokes is one request.
 const KW_DEBOUNCE_MS: u64 = 120;
 
 /// How long Escape must be held before it collapses the whole navigation stack
@@ -90,10 +85,8 @@ pub struct PanelEntry {
     /// Optional path to an image file used as the shortcut icon instead of `glyph`.
     pub icon: Option<String>,
     /// Builds a fresh view each time the panel is opened. Reads current config
-    /// itself, so settings edits take effect on the next open. Receives the
-    /// search text the panel was opened from (`None` when opened from Home /
-    /// recents), so panels like the LLM chat can seed themselves with it.
-    pub make_view: Box<dyn Fn(&mut App, Option<&str>) -> AnyView>,
+    /// itself, so settings edits take effect on the next open.
+    pub make_view: Box<dyn Fn(&mut App) -> AnyView>,
 }
 
 /// A settings tab contributed by an extension.
@@ -108,36 +101,6 @@ pub struct SettingsTabFactory {
 pub struct MenuItem {
     pub title: String,
     pub action: Box<dyn Fn(&mut App)>,
-}
-
-/// Request handed to an [`AutocompleteProvider`]. Runs on a background thread, so
-/// everything here is owned.
-pub struct AutocompleteRequest {
-    /// The current search text.
-    pub query: String,
-    /// A strong local match (top result title) offered to the model as a
-    /// candidate completion, when the local result was high-scoring.
-    pub top_hint: Option<String>,
-}
-
-/// Ghost text plus ready-made "Ask AI" suggestion rows returned by an
-/// [`AutocompleteProvider`].
-pub struct Suggestions {
-    /// Inline continuation of the query (only the text that *follows* it); empty
-    /// when there's nothing to suggest.
-    pub ghost: String,
-    /// Complete result rows to splice into the list (already carrying their own
-    /// [`Action::OpenPanel`] seed).
-    pub entries: Vec<ResultItem>,
-}
-
-/// An AI autocomplete source contributed by an extension. `suggest` is called off
-/// the UI thread (blocking network is fine) and returns `None` when disabled or
-/// unconfigured. Wrapped in an `Arc` so the shell can clone it into a background
-/// task.
-#[derive(Clone)]
-pub struct AutocompleteProvider {
-    pub suggest: Arc<dyn Fn(AutocompleteRequest) -> Option<Suggestions> + Send + Sync>,
 }
 
 /// A live "now playing" state source contributed by an extension, rendered as a
@@ -199,8 +162,6 @@ pub struct UiExtensions {
     /// Extra entries added to the menu-bar menu (between the built-in
     /// Open/Settings and Launch-at-Login/Quit items).
     pub menu_items: Vec<MenuItem>,
-    /// Optional inline AI autocomplete + "Ask AI" suggestion source.
-    pub autocomplete: Option<AutocompleteProvider>,
     /// Optional now-playing card shown at the top of Home while music is loaded.
     pub now_playing: Option<NowPlayingSource>,
 }
@@ -271,29 +232,15 @@ pub struct SpotlightView {
     screen: Screen,
     query: String,
     results: Vec<ResultItem>,
-    /// `results` before AI suggestions are spliced in. Kept so a late
-    /// suggestion can be re-spliced without re-running the query — which, for a
-    /// keyword-routed extension, would mean another network round trip.
-    ranked: Vec<ResultItem>,
     selected: usize,
-    /// Greyed-out inline autocomplete: the continuation shown after the caret and
-    /// accepted with Tab. Seeded instantly from a strong local match, then
-    /// replaced by the LLM's completion when it arrives.
+    /// Greyed-out inline completion: the continuation shown after the caret and
+    /// accepted with Tab, taken from a strong local match's title.
     ghost: String,
-    /// AI-suggested "Ask AI" rows for `ai_query`, spliced into `results`.
-    ai_suggestions: Vec<ResultItem>,
-    /// The query `ghost`/`ai_suggestions` were computed for; guards against
-    /// splicing stale suggestions after the query has moved on.
-    ai_query: String,
-    /// Bumped on every query change so a late response — autocomplete or a
-    /// keyword-routed search — for an older query can be dropped.
+    /// Bumped on every query change so a late keyword-routed search response
+    /// for an older query can be dropped.
     query_gen: u64,
-    /// The in-flight debounced autocomplete task (dropped/cancelled on the next
-    /// keystroke by being replaced).
-    ac_task: Option<gpui::Task<()>>,
-    /// The in-flight keyword-routed search, held for the same reason: replacing
-    /// it drops the pending debounce timer, so a superseded query never fires
-    /// its request at all.
+    /// The in-flight keyword-routed search; replacing it drops the pending
+    /// debounce timer, so a superseded query never fires its request at all.
     search_task: Option<gpui::Task<()>>,
     focus_handle: FocusHandle,
     /// Rasterized app icons keyed by path, so each icon is rasterized once and
@@ -413,13 +360,9 @@ impl SpotlightView {
             screen: Screen::Home,
             query: String::new(),
             results: Vec::new(),
-            ranked: Vec::new(),
             selected: 0,
             ghost: String::new(),
-            ai_suggestions: Vec::new(),
-            ai_query: String::new(),
             query_gen: 0,
-            ac_task: None,
             search_task: None,
             focus_handle,
             icon_cache: HashMap::new(),
@@ -494,7 +437,7 @@ impl SpotlightView {
             if !q.is_empty() {
                 view.query = q;
                 // Go through the real query path so captures exercise the ghost
-                // autocomplete and any AI suggestion rows.
+                // completion.
                 view.refresh_query(cx);
             }
         }
@@ -503,7 +446,7 @@ impl SpotlightView {
                 "settings" => view.go_settings(cx),
                 id if !id.is_empty() => {
                     let id = id.to_string();
-                    view.go_panel(&id, None, cx);
+                    view.go_panel(&id, cx);
                 }
                 _ => {}
             }
@@ -543,7 +486,6 @@ impl SpotlightView {
         // The ghost belongs to the query we just dropped. Left behind it renders
         // alongside the placeholder on Home, and Tab would accept it.
         self.ghost.clear();
-        self.ac_task = None;
         self.selected = 0;
         self.reset_home_sel();
         window.focus(&self.focus_handle, cx);
@@ -569,9 +511,7 @@ impl SpotlightView {
         cx.notify();
     }
 
-    /// `seed` is the search text the panel was opened from (`None` from Home /
-    /// recents), passed through to the panel's `make_view` so it can pre-fill.
-    fn go_panel(&mut self, id: &str, seed: Option<String>, cx: &mut Context<Self>) {
+    fn go_panel(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(entry) = self.ui.panels.iter().find(|p| p.id == id) else {
             return;
         };
@@ -580,7 +520,7 @@ impl SpotlightView {
         let glyph = entry.glyph.clone();
         let icon = entry.icon.clone();
         let from = self.screen.clone();
-        let view = (entry.make_view)(cx, seed.as_deref());
+        let view = (entry.make_view)(cx);
         self.panel = Some(view);
         self.screen = Screen::Extension(id.to_string());
         self.selected = 0;
@@ -696,40 +636,12 @@ impl SpotlightView {
         self.boost_and_rank(block_on(self.registry.query(query)))
     }
 
-    /// Splice the AI "Ask AI" suggestion rows (when current for this query) into a
-    /// ranked list, grouped just above the generic Ask AI entry (same source).
-    fn splice_suggestions(&self, mut ranked: Vec<ResultItem>) -> Vec<ResultItem> {
-        if self.ai_query == self.query {
-            if let Some(first) = self.ai_suggestions.first() {
-                let src = first.source.clone();
-                let pos = ranked.iter().position(|r| r.source == src).unwrap_or(ranked.len());
-                for (i, item) in self.ai_suggestions.iter().enumerate() {
-                    ranked.insert(pos + i, item.clone());
-                }
-            }
-        }
-        ranked
-    }
-
-    /// Store a fresh ranking and rebuild the visible rows from it.
-    fn set_ranked(&mut self, ranked: Vec<ResultItem>) {
-        self.results = self.splice_suggestions(ranked.clone());
-        self.ranked = ranked;
-    }
-
-    /// Re-splice AI suggestions into the current ranking. Called when an
-    /// autocomplete response arrives (the query itself is unchanged), so the
-    /// stored ranking is reused rather than recomputed.
-    fn rebuild_results(&mut self) {
-        self.results = self.splice_suggestions(self.ranked.clone());
-    }
-
     /// Rows to show while a routed search is in flight: whatever is already on
     /// screen if it came from the same extension — so typing refines a list
     /// instead of flashing it away — otherwise a single placeholder.
     fn pending_rows(&self, ext: &dyn Extension) -> Vec<ResultItem> {
-        if !self.ranked.is_empty() && self.ranked.iter().all(|r| r.source == ext.id()) {
-            return self.ranked.clone();
+        if !self.results.is_empty() && self.results.iter().all(|r| r.source == ext.id()) {
+            return self.results.clone();
         }
         vec![ResultItem {
             id: "search:pending".to_string(),
@@ -767,8 +679,7 @@ impl SpotlightView {
                 if t.query_gen != gen {
                     return;
                 }
-                let ranked = t.boost_and_rank(items);
-                t.set_ranked(ranked);
+                t.results = t.boost_and_rank(items);
                 t.selected = t.selected.min(t.results.len().saturating_sub(1));
                 cx.notify();
             });
@@ -777,14 +688,10 @@ impl SpotlightView {
 
     fn refresh_query(&mut self, cx: &mut Context<Self>) {
         let query = self.query.clone();
-        // A new query supersedes any pending autocomplete and its (now stale)
-        // ghost. Keep prior suggestions only if they were computed for this exact
-        // query (e.g. re-entering after Escape); otherwise drop them.
+        // A new query supersedes any in-flight routed search and the (now
+        // stale) ghost.
         self.query_gen = self.query_gen.wrapping_add(1);
         self.ghost.clear();
-        if self.ai_query != query {
-            self.ai_suggestions.clear();
-        }
 
         // A keyword-routed extension is queried off the UI thread: it may go to
         // the network, and blocking here would freeze the whole panel — down to
@@ -801,17 +708,11 @@ impl SpotlightView {
             }
         };
 
-        // Rank once, then reuse the ranking to seed an instant heuristic ghost and
-        // a candidate hint for the model. A routed query has no ranking yet — and
-        // its rows are an extension's own phrasing, not something to complete the
-        // query with — so it gets neither.
-        let hint = if self.search_task.is_some() {
-            None
-        } else {
-            ranked.iter().find(|r| r.score > 0).map(|r| r.title.clone())
-        };
-        if !query.is_empty() {
-            if let Some(h) = &hint {
+        // Seed the ghost from the ranking's strongest match. A routed query has
+        // no ranking yet — and its rows are an extension's own phrasing, not
+        // something to complete the query with — so it gets none.
+        if !query.is_empty() && self.search_task.is_none() {
+            if let Some(h) = ranked.iter().find(|r| r.score > 0).map(|r| r.title.clone()) {
                 let (ql, hl) = (query.to_lowercase(), h.to_lowercase());
                 if hl.starts_with(&ql) && h.chars().count() > query.chars().count() {
                     // Continuation by char count, so a case-insensitive match never
@@ -820,7 +721,7 @@ impl SpotlightView {
                 }
             }
         }
-        self.set_ranked(ranked);
+        self.results = ranked;
 
         self.selected = 0;
         self.screen = if self.query.trim().is_empty() {
@@ -829,51 +730,7 @@ impl SpotlightView {
         } else {
             Screen::Search
         };
-
-        // Debounced AI autocomplete (replaces/refines the heuristic ghost and adds
-        // suggestion rows). Dropping the previous task cancels its pending timer.
-        self.ac_task = if self.ui.autocomplete.is_some() && query.chars().count() >= MIN_AC_LEN {
-            Some(self.schedule_autocomplete(query, hint, cx))
-        } else {
-            None
-        };
         cx.notify();
-    }
-
-    /// Fire a debounced autocomplete request on the background executor and, when
-    /// it returns for the still-current query, apply its ghost + suggestion rows.
-    fn schedule_autocomplete(
-        &self,
-        query: String,
-        hint: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Task<()> {
-        let gen = self.query_gen;
-        let suggest = self.ui.autocomplete.as_ref().unwrap().suggest.clone();
-        cx.spawn(async move |weak, cx| {
-            cx.background_executor().timer(Duration::from_millis(AC_DEBOUNCE_MS)).await;
-            // Superseded by a newer keystroke while we waited out the debounce.
-            if weak.update(cx, |t, _| t.query_gen != gen).unwrap_or(true) {
-                return;
-            }
-            let req = AutocompleteRequest { query: query.clone(), top_hint: hint };
-            let out = cx.background_executor().spawn(async move { (suggest)(req) }).await;
-            let Some(s) = out else { return };
-            let _ = weak.update(cx, |t, cx| {
-                if t.query_gen != gen || t.query != query {
-                    return;
-                }
-                // The LLM completion replaces the instant heuristic; if it came
-                // back empty, the heuristic ghost stays.
-                if !s.ghost.is_empty() {
-                    t.ghost = s.ghost;
-                }
-                t.ai_suggestions = s.entries;
-                t.ai_query = query.clone();
-                t.rebuild_results();
-                cx.notify();
-            });
-        })
     }
 
     /// Length of the currently navigable Search results list.
@@ -959,7 +816,7 @@ impl SpotlightView {
             HomeSel::Shortcuts(i) => {
                 if i < self.ui.panels.len() {
                     let id = self.ui.panels[i].id.clone();
-                    self.go_panel(&id, None, cx);
+                    self.go_panel(&id, cx);
                 } else {
                     self.go_settings(cx);
                 }
@@ -989,14 +846,10 @@ impl SpotlightView {
                 self.hide(window, cx);
                 return;
             }
-            Action::OpenPanel { id, seed } => {
-                // Navigate into the panel (which records its own recents entry),
-                // seeding it with the item's own text when set (AI suggestion
-                // entries), else the current search text so chat-style panels can
-                // pre-fill and auto-send.
+            Action::OpenPanel { id } => {
+                // Navigate into the panel (which records its own recents entry).
                 let id = id.clone();
-                let seed = seed.clone().unwrap_or_else(|| self.query.clone());
-                self.go_panel(&id, Some(seed), cx);
+                self.go_panel(&id, cx);
                 return;
             }
             Action::Custom(id) => {
@@ -1046,7 +899,7 @@ impl SpotlightView {
     fn reopen_and_record(&mut self, recent: Recent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = &recent.panel {
             let id = panel.clone();
-            self.go_panel(&id, None, cx);
+            self.go_panel(&id, cx);
             return;
         }
         reopen_recent(&recent);
@@ -1676,7 +1529,7 @@ impl SpotlightView {
             strip = strip.child(
                 home_card(leading, &p.title).id(("home-shortcut", i)).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.go_panel(&id, None, cx)),
+                    cx.listener(move |this, _, _, cx| this.go_panel(&id, cx)),
                 ),
             );
         }
@@ -2529,7 +2382,6 @@ fn section_label(text: &str) -> impl IntoElement {
 fn settings_glyph(title: &str) -> &'static str {
     match title {
         "General" => "\u{2699}",   // gear
-        "AI" => "\u{2728}",        // sparkles
         "Jira" => "\u{25c8}",      // diamond-in-square
         "Clipboard" => "\u{2632}", // trigram (list-ish)
         _ => "\u{2022}",           // bullet

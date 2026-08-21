@@ -115,7 +115,7 @@ pub fn panel_entry() -> PanelEntry {
         title: "Gmail".to_string(),
         glyph: "✉️".to_string(),
         icon: Some(icon_path()),
-        make_view: Box::new(|cx, _seed| cx.new(GmailView::new).into()),
+        make_view: Box::new(|cx| cx.new(GmailView::new).into()),
     }
 }
 
