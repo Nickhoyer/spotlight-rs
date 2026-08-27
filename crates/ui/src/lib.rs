@@ -1248,6 +1248,14 @@ impl SpotlightView {
                         |(i, item)| {
                             let icon = resolve_icon(icon_cache, &item.icon);
                             result_row(item, icon, i == selected)
+                                .id(("search-result", i))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.selected = i;
+                                        this.activate_search(window, cx);
+                                    }),
+                                )
                         },
                     ))
                     .into_any_element()
@@ -2589,7 +2597,7 @@ fn resolve_icon(
     Some(render_image)
 }
 
-fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool) -> impl IntoElement {
+fn result_row(item: &ResultItem, icon: Option<Arc<RenderImage>>, _selected: bool) -> gpui::Div {
     let accent = theme::accent();
     // A result that opens a built-in panel (e.g. Clipboard History) uses that
     // panel's generated logo, so search matches the Home tiles.
